@@ -1,18 +1,33 @@
-# Build and Release Folders
-bin-debug/
-bin-release/
-[Oo]bj/
-[Bb]in/
+# Model weights (large, downloaded per-machine)
+weights/*
+!weights/.gitkeep
 
-# Other files and folders
-.settings/
+# Sample media (also large)
+*.mp4
+*.mov
+*.mkv
+samples/*.jpg
+samples/*.png
 
-# Executables
-*.swf
-*.air
-*.ipa
-*.apk
+# Calibration outputs
+calib*.json
+calib*.jpg
 
-# Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
-# should NOT be excluded as they contain compiler settings and other important
-# information for Eclipse / Flash Builder.
+# Debug dumps
+court_dbg/
+diagnostics/
+/tmp/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.ipynb_checkpoints/
+.pytest_cache/
+*.egg-info/
+.DS_Store
+
+# Editor
+.vscode/
+.idea/

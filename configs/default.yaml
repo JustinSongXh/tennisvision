@@ -1,0 +1,50 @@
+court:
+  detector: mark              # mark | tcd | resnet | blue
+  weights: weights/court_tcd.pt
+  input_size: [640, 360]
+
+ball:
+  detector: wasb              # wasb | classical
+  weights: weights/wasb_tennis_best.pth.tar
+  device: cpu
+  runtime: auto               # auto | torch | onnx
+  onnx_path: null             # default = <weights>.onnx next to .pth.tar
+  score_threshold: 0.5
+  max_disp: 300.0
+  # classical-detector parameters (used only if detector==classical)
+  hsv_low:  [25, 60, 120]
+  hsv_high: [50, 255, 255]
+  min_area: 3
+  max_area: 400
+  min_circularity: 0.55
+  mog_var_threshold: 25
+  player_min_area: 1500
+  player_max_area: 60000
+  player_max_w_frac: 0.55
+  player_max_h_frac: 0.75
+
+tracker:
+  gate_px: 120               # looser — WASB detections are usually accurate
+  max_gap_frames: 8
+  min_len: 3
+  min_speed: 5.0             # WASB doesn't produce jittery near-stationary noise
+  max_speed: 200.0
+  render_tail: 45
+
+bounce:
+  detector: catboost         # peak | catboost
+  weights: weights/bounce_catboost.cbm
+  lookback: 3
+  min_dy: 4
+  cooldown: 10
+  catboost_threshold: 0.20
+  catboost_nms_window: 1
+  min_track_len: 8
+
+render:
+  minimap_width_px: 150
+  minimap_margin_px: 15
+  bounce_fade_frames: 600
+
+debug:
+  dir: null

@@ -1,0 +1,14 @@
+# Extras for deep-learning models (V1 / V2 / V3)
+-r requirements.txt
+
+torch>=1.9
+torchvision>=0.10
+catboost>=1.0
+scipy>=1.5
+
+# CPU-accelerated inference — pick ONE:
+#   onnxruntime            -- plain CPU EP (MKL); 3x over raw PyTorch
+#   onnxruntime-openvino   -- adds OpenVINO EP (Intel CPUs only); another 1.5-2x
+# Uncomment whichever applies:
+# onnxruntime>=1.15
+# onnxruntime-openvino>=1.15

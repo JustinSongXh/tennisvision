@@ -1,0 +1,6 @@
+bounce:
+  detector: catboost
+  weights: weights/bounce_catboost.cbm
+  catboost_threshold: 0.20
+  catboost_nms_window: 1
+  min_track_len: 8
