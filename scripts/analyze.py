@@ -21,7 +21,7 @@ def main():
     p.add_argument("--out",    required=True, help="output annotated .mp4")
     p.add_argument("--calib",  required=True, help="calib.json")
     p.add_argument("--config", default=None, help="YAML config (optional)")
-    p.add_argument("--progress-every", type=int, default=200)
+    p.add_argument("--progress-every", type=int, default=100)
     args = p.parse_args()
 
     cfg = load_config(args.config)

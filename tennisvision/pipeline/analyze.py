@@ -151,8 +151,9 @@ def run(
     calib: Calibration,
     cfg: dict,
     *,
-    progress_every: int = 200,
+    progress_every: int = 100,
 ) -> AnalyzeResult:
+    import time
     ball_det, ball_detect_fn = _build_ball_detector(cfg["ball"])
     tcfg = cfg["tracker"]
     tracker = MultiTrackManager(TrackerConfig(
@@ -184,7 +185,9 @@ def run(
     tail_len = tcfg["render_tail"]
     frame_idx = 0
 
-    print("[pass 1] tracking ...")
+    print("[pass 1] tracking %d frames ..." % total, flush=True)
+    t0 = time.time()
+    t_last = t0
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -214,25 +217,32 @@ def run(
         frame_states[frame_idx] = fs
 
         if frame_idx % progress_every == 0:
-            print("  frame %d / %d (%d retired tracks)"
-                  % (frame_idx, total, len(retired_tracks)))
+            now = time.time()
+            fps = progress_every / max(now - t_last, 1e-6)
+            eta = (total - frame_idx) / max(fps, 1e-6)
+            print("  frame %d / %d  %.1f fps  eta %.0fs  (%d retired tracks)"
+                  % (frame_idx, total, fps, eta, len(retired_tracks)),
+                  flush=True)
+            t_last = now
     cap.release()
+    print("[pass 1] done in %.1fs  (%d validated tracks)" %
+          (time.time() - t0, sum(1 for t in retired_tracks.values() if t.validated)),
+          flush=True)
 
     # Also include tracks still alive after the last frame
     for t in tracker.tracks:
         if t.validated:
             retired_tracks.setdefault(t.id, t)
     all_tracks = list(retired_tracks.values())
-    print("[pass 1] done — %d frames, %d validated tracks" %
-          (frame_idx, len(all_tracks)))
 
     # ------------------------------------------------------------------
     # BOUNCE DETECTION
     # ------------------------------------------------------------------
-    print("[bounces] detector=%s ..." % cfg["bounce"]["detector"])
+    print("[bounces] detector=%s ..." % cfg["bounce"]["detector"], flush=True)
     events = _run_bounce_detector(all_tracks, cfg)
     bounces_court = _project_bounces(events, calib)
-    print("[bounces] %d raw events -> %d on-court" % (len(events), len(bounces_court)))
+    print("[bounces] %d raw events -> %d on-court" %
+          (len(events), len(bounces_court)), flush=True)
 
     # ------------------------------------------------------------------
     # PASS 2 — render
@@ -242,8 +252,10 @@ def run(
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(output_path, fourcc, fps, (W, H))
 
-    print("[pass 2] rendering ...")
+    print("[pass 2] rendering %d frames ..." % total, flush=True)
     frame_idx = 0
+    t0 = time.time()
+    t_last = t0
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -266,10 +278,16 @@ def run(
 
         out.write(vis)
         if frame_idx % progress_every == 0:
-            print("  frame %d / %d" % (frame_idx, total))
+            now = time.time()
+            fps = progress_every / max(now - t_last, 1e-6)
+            eta = (total - frame_idx) / max(fps, 1e-6)
+            print("  frame %d / %d  %.1f fps  eta %.0fs"
+                  % (frame_idx, total, fps, eta), flush=True)
+            t_last = now
 
     cap.release()
     out.release()
+    print("[pass 2] done in %.1fs" % (time.time() - t0), flush=True)
 
     return AnalyzeResult(
         total_frames=frame_idx,
