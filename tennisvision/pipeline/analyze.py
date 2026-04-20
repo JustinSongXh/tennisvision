@@ -35,6 +35,9 @@ from ..bounce.peak import BounceEvent, PeakBounceConfig, detect_all as peak_dete
 from ..court import reference as ref
 from ..court.calibration import Calibration
 from ..court.homography import project_image_to_court
+from ..render.action import (
+    draw_players, draw_stroke_labels, events_by_player_sorted,
+)
 from ..render.hud import draw_hud
 from ..render.minimap import Minimap, MinimapConfig
 from ..render.trail import draw_trail
@@ -47,6 +50,10 @@ class _FrameState:
     champion_id: Optional[int] = None
     champion_trail: list = field(default_factory=list)   # list of (x, y, frame)
     is_current_det: bool = False
+    # Present when action.player is enabled: {track_id: (x0, y0, x1, y1)}.
+    # Captured from the stroke recognizer on every Pass-1 frame so Pass-2
+    # can render per-player bboxes without re-running YOLOv8.
+    player_bboxes: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -55,6 +62,9 @@ class AnalyzeResult:
     bounces: int
     validated_tracks: int
     stroke_events: list = field(default_factory=list)
+    inpainted_frames: int = 0        # only set when ball.inpainter.enabled
+    coverage_before: int = 0         # frames with an original detection
+    coverage_after: int = 0          # frames with a point after inpainting
 
 
 def _build_stroke_recognizer(acfg, calib=None):
@@ -146,6 +156,74 @@ def _build_ball_detector(bcfg):
             return [pt] if pt is not None else []
         return det, _run
     raise NotImplementedError("ball.detector=%r not supported" % name)
+
+
+def _maybe_inpaint(tracks: list, icfg: dict, frame_size: tuple) -> tuple:
+    """If `ball.inpainter.enabled`, fill each validated Track's INTERNAL
+    gaps with InpaintNet and return a new list of synthetic Tracks.
+    Otherwise return the input tracks unchanged.
+
+    Per-track, not merged: the tracker already decided whether two
+    separated segments belong to the same trajectory (via its own
+    max_gap_frames).  If it split them into two Tracks, we respect that
+    and do NOT fabricate a bridge between them — bridging across rallies
+    or across a ball leaving the frame was the failure mode of the
+    earlier merged-series approach (false bounces on synthesized
+    between-track motion).
+
+    Second return value is a stats dict (or None) for logging.
+    """
+    if not icfg or not icfg.get("enabled"):
+        return tracks, None
+    from ..ball.inpainter import (
+        InpaintNetConfig, TrajectoryInpainter, result_to_trackpoints,
+    )
+    inp = TrajectoryInpainter(
+        InpaintNetConfig(
+            weights=icfg["weights"], device=icfg.get("device", "cpu"),
+            window_mode=icfg.get("window_mode", "single"),
+            seq_len=icfg.get("seq_len"),
+            max_gap_frames=icfg.get("max_gap_frames", 60),
+            th_h_frac=icfg.get("th_h_frac", 0.05),
+        ),
+        frame_size=frame_size,
+    )
+
+    new_tracks: list = []
+    total_series_len = 0
+    total_coverage_before = 0
+    total_coverage_after = 0
+    total_filled = 0
+
+    for t in tracks:
+        res = inp.inpaint_tracks([t])     # single-track series, no cross-track merge
+        pts = result_to_trackpoints(res)
+        if not pts:
+            new_tracks.append(t)
+            total_series_len += len(t.pts)
+            total_coverage_before += len(t.pts)
+            total_coverage_after += len(t.pts)
+            continue
+        fake = Track(pts[0].x, pts[0].y, pts[0].frame,
+                     min_len=1, min_speed=0.0, max_speed=1e9)
+        fake.pts = list(pts)
+        fake.validated = True
+        new_tracks.append(fake)
+
+        finite = ~np.isnan(res.xs)
+        total_series_len += len(res.xs)
+        total_coverage_before += int((finite & ~res.was_inpainted).sum())
+        total_coverage_after += len(pts)
+        total_filled += int(res.was_inpainted.sum())
+
+    stats = {
+        "orig_tracks": len(tracks),
+        "series_len": total_series_len,
+        "coverage_before": total_coverage_before,
+        "coverage_after": total_coverage_after,
+        "inpainted_frames": total_filled,
+    }
+    return new_tracks, stats
 
 
 def _run_bounce_detector(tracks: list, cfg: dict) -> list:
@@ -284,14 +362,16 @@ def run(
                 (p.x, p.y, p.frame) for p in champion.pts
                 if frame_idx - p.frame <= tail_len
             ]
+        if stroke_rec is not None:
+            fs.player_bboxes = dict(getattr(stroke_rec, "last_detections", {}))
         frame_states[frame_idx] = fs
 
         if frame_idx % progress_every == 0:
             now = time.time()
-            fps = progress_every / max(now - t_last, 1e-6)
-            eta = (total - frame_idx) / max(fps, 1e-6)
+            proc_fps = progress_every / max(now - t_last, 1e-6)
+            eta = (total - frame_idx) / max(proc_fps, 1e-6)
             print("  frame %d / %d  %.1f fps  eta %.0fs  (%d retired tracks)"
-                  % (frame_idx, total, fps, eta, len(retired_tracks)),
+                  % (frame_idx, total, proc_fps, eta, len(retired_tracks)),
                   flush=True)
             t_last = now
     cap.release()
@@ -322,10 +402,26 @@ def run(
     all_tracks = list(retired_tracks.values())
 
     # ------------------------------------------------------------------
+    # TRAJECTORY INPAINTING (optional; V2)
+    # ------------------------------------------------------------------
+    icfg = cfg.get("inpainter", {})
+    bounce_input_tracks, inpaint_stats = _maybe_inpaint(
+        all_tracks, icfg, frame_size=(W, H))
+    if inpaint_stats is not None:
+        print("[inpaint] %d orig tracks -> series len %d; "
+              "coverage %d -> %d (+%d filled frames)" % (
+                  inpaint_stats["orig_tracks"],
+                  inpaint_stats["series_len"],
+                  inpaint_stats["coverage_before"],
+                  inpaint_stats["coverage_after"],
+                  inpaint_stats["inpainted_frames"],
+              ), flush=True)
+
+    # ------------------------------------------------------------------
     # BOUNCE DETECTION
     # ------------------------------------------------------------------
     print("[bounces] detector=%s ..." % cfg["bounce"]["detector"], flush=True)
-    events = _run_bounce_detector(all_tracks, cfg)
+    events = _run_bounce_detector(bounce_input_tracks, cfg)
     bounces_court = _project_bounces(events, calib)
     print("[bounces] %d raw events -> %d on-court" %
           (len(events), len(bounces_court)), flush=True)
@@ -337,6 +433,14 @@ def run(
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(output_path, fourcc, fps, (W, H))
+
+    # Per-player event bucket for the stroke-label overlay.  Sorted once
+    # here so Pass 2's bisect lookup stays O(log n).
+    events_by_player = events_by_player_sorted(stroke_events)
+    # Keep stroke labels visible for 2 s past the event (upstream classifier
+    # fires every `stride` frames per player, so at 30 fps the label is
+    # refreshed long before this TTL expires during active play).
+    stroke_label_ttl = int(round(fps * 2.0)) if fps else 60
 
     print("[pass 2] rendering %d frames ..." % total, flush=True)
     frame_idx = 0
@@ -354,6 +458,10 @@ def run(
             pts_obj = [TrackPoint(x, y, f) for (x, y, f) in fs.champion_trail]
             draw_trail(vis, pts_obj, frame_idx,
                        tail=tail_len, is_current_det=fs.is_current_det)
+        if fs.player_bboxes:
+            draw_players(vis, fs.player_bboxes)
+            draw_stroke_labels(vis, fs.player_bboxes, events_by_player,
+                               frame_idx, ttl_frames=stroke_label_ttl)
         minimap.overlay(vis, bounces_court, frame_idx)
         n_shown = sum(1 for _, _, f in bounces_court if f <= frame_idx)
 
@@ -367,10 +475,10 @@ def run(
         out.write(vis)
         if frame_idx % progress_every == 0:
             now = time.time()
-            fps = progress_every / max(now - t_last, 1e-6)
-            eta = (total - frame_idx) / max(fps, 1e-6)
+            proc_fps = progress_every / max(now - t_last, 1e-6)
+            eta = (total - frame_idx) / max(proc_fps, 1e-6)
             print("  frame %d / %d  %.1f fps  eta %.0fs"
-                  % (frame_idx, total, fps, eta), flush=True)
+                  % (frame_idx, total, proc_fps, eta), flush=True)
             t_last = now
 
     cap.release()
@@ -382,4 +490,7 @@ def run(
         bounces=len(bounces_court),
         validated_tracks=len(all_tracks),
         stroke_events=stroke_events,
+        inpainted_frames=(inpaint_stats["inpainted_frames"] if inpaint_stats else 0),
+        coverage_before=(inpaint_stats["coverage_before"] if inpaint_stats else 0),
+        coverage_after=(inpaint_stats["coverage_after"] if inpaint_stats else 0),
     )

@@ -37,6 +37,22 @@ DEFAULTS: dict = {
         "player_max_w_frac": 0.55,
         "player_max_h_frac": 0.75,
     },
+    "inpainter": {
+        # TrackNetV3 InpaintNet: learned gap-filler run on the union of
+        # validated tracks before bounce detection.  Default off —
+        # shuttlecock-trained, empirical on tennis; A/B vs baseline on
+        # your video before trusting.
+        "enabled": False,
+        "weights": "weights/InpaintNet_best.pt",
+        "device": "cpu",
+        # "single" — one forward pass over the whole series (fully-conv,
+        # no seam artifacts).  "nonoverlap" — non-overlap windows of
+        # seq_len (faithful to upstream eval).
+        "window_mode": "single",
+        "seq_len": None,                     # None = use ckpt's stored value (typ. 16)
+        "max_gap_frames": 60,                # skip gaps longer than this
+        "th_h_frac": 0.05,                   # out-of-view y-threshold as fraction of H
+    },
     "tracker": {
         "gate_px": 120,
         "max_gap_frames": 8,

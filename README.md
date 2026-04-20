@@ -46,10 +46,11 @@
 | **球检测** (`ball.detector`) | `classical` — HSV + MOG2 / `wasb` — WASB HRNet | **`wasb`** | `wasb_tennis_best.pth.tar`（首次运行自动导出为 `.onnx`） |
 | **球轨迹** | 多目标 Kalman + champion 选择 | 唯一 | 无 |
 | **落点检测** (`bounce.detector`) | `peak` — y 方向极值 baseline / `catboost` — 轨迹特征分类器 | **`catboost`** | `bounce_catboost.cbm` |
+| **轨迹补洞** (`ball.inpainter.enabled`) | TrackNetV3 InpaintNet —— 学习式填充 validated track 内部空洞（默认关闭） | 关闭 | `InpaintNet_best.pt` |
 | **球员检测** (`action.player.enabled`) | YOLOv8n + ByteTrack（`true`） / 关闭后退为全帧单人（`false`） | `true` | `yolov8n.pt` |
 | **球员姿态** | MoveNet SinglePose Lightning fp16 TFLite | 唯一 | `movenet_lightning_f16.tflite` |
 | **击球分类** (`action.enabled`) | 30 帧滑窗 + Keras GRU（默认关闭，需显式开启） | 关闭 | `tennis_rnn.h5`（需 `tf-keras` 加载） |
-| **渲染** | trail / minimap / hud，固定组合 | 唯一 | 无 |
+| **渲染** | trail / minimap / hud / player bbox + stroke label | 唯一 | 无 |
 
 > **切换实现方式**：写一份 `configs/your.yaml` 覆盖对应字段，如 `ball.detector: classical` 或 `action.enabled: true`，运行时传 `--config configs/your.yaml`。完整字段见 [`tennisvision/config.py:DEFAULTS`](tennisvision/config.py)。
 
@@ -64,11 +65,14 @@ tennisvision/
 ├── .gitignore                       # 忽略 weights/ *.mp4 等
 │
 ├── configs/
-│   └── default.yaml                 # 默认 pipeline 配置
+│   ├── default.yaml                 # 默认 pipeline 配置
+│   ├── remote_inpaint.yaml          # 远程测试机：InpaintNet + action 全开
+│   └── remote_inpaint_debug.yaml    # 同上，debug 模式
 │
 ├── weights/                         # 模型权重（gitignored）
 │   ├── court_tcd.pt                 # TennisCourtDetector（标定可选）
 │   ├── wasb_tennis_best.pth.tar     # WASB HRNet 球检测（首次运行自动导出 .onnx）
+│   ├── InpaintNet_best.pt           # TrackNetV3 InpaintNet 轨迹补洞（可选）
 │   ├── bounce_catboost.cbm          # CatBoost 落点分类器
 │   ├── yolov8n.pt                   # YOLOv8n 球员检测（ultralytics 首次运行也会自动下）
 │   ├── movenet_lightning_f16.tflite # MoveNet 球员姿态
@@ -93,6 +97,7 @@ tennisvision/
 │   │   ├── __init__.py
 │   │   ├── classical.py             # HSV + MOG2（当前方案）
 │   │   ├── tracknet.py              # TrackNet / WASB 推理
+│   │   ├── inpainter.py             # TrackNetV3 InpaintNet 轨迹补洞（可选）
 │   │   └── tracker.py               # Kalman 多目标 + champion 选择
 │   │
 │   ├── bounce/                      # 落点检测
@@ -104,7 +109,8 @@ tennisvision/
 │   │   ├── __init__.py
 │   │   ├── minimap.py               # 右侧 mini-map
 │   │   ├── trail.py                 # 球轨迹叠加
-│   │   └── hud.py                   # 文字 HUD
+│   │   ├── hud.py                   # 文字 HUD
+│   │   └── action.py                # 球员 bbox + 击球标签叠加
 │   │
 │   ├── action/                      # 球员姿态 + 击球分类（V3）
 │   │   ├── __init__.py
@@ -125,7 +131,8 @@ tennisvision/
 │   ├── test_reference.py
 │   ├── test_homography.py
 │   ├── test_tracker.py
-│   └── test_bounce.py
+│   ├── test_bounce.py
+│   └── test_inpainter.py
 │
 └── samples/                         # 测试素材（或外链）
     └── README.md
@@ -211,6 +218,22 @@ tennisvision/
 #### `tracknet.py` — TrackNet / 其他备选（未实现）
 对照组；yastrebksv/TrackNet + ONNX 也是可选项，但 WASB **MIT 协议** + 更小 + tennis 微调权重更适合公开发布
 
+#### `inpainter.py` — TrackNetV3 InpaintNet 轨迹补洞（可选，默认关）
+- **来源**：移植自 [qaz812345/TrackNetV3](https://github.com/qaz812345/TrackNetV3)（InpaintNet + generate_inpaint_mask），原始权重在羽毛球数据集上训练，tennis 上经验性使用。
+- **职责**：在 Pass 1 结束、落点检测开始前，对每条 validated Track 的**内部空洞**做学习式填充；返回填充后的 `(x, y, was_inpainted)` 序列。
+- **设计选择 —— 逐 Track 而非跨 Track**：tracker 已决定哪些段属于同一轨迹；不在两条 Track 之间做桥接（跨 rally / 球出画面的合并是误检来源）。
+- **`window_mode`**：
+  - `single`（默认）—— 一次前向覆盖整条轨迹（全卷积，无接缝）
+  - `nonoverlap` —— 非重叠滑窗（忠实于上游评估方式）
+- **接口**：
+  ```python
+  inp = TrajectoryInpainter(InpaintNetConfig(...), frame_size=(W, H))
+  res = inp.inpaint_tracks([track])   # InpaintResult: xs, ys, was_inpainted
+  pts = result_to_trackpoints(res)
+  ```
+- **pipeline 位置**：`pipeline/analyze.py:_maybe_inpaint`，在 `_run_bounce_detector` 之前调用；`ball.inpainter.enabled=false` 时零开销。
+- **统计日志**：启用时在终端打印 `coverage before/after + inpainted frames` 便于 A/B 对比。
+
 #### `tracker.py` — 多轨迹 Kalman + champion
 - **职责**：把每帧候选点 association 成跨帧的 track；每帧选出唯一的"champion"（当前最可信的球轨迹）。
 - **算法**（现状保留）：
@@ -255,6 +278,12 @@ tennisvision/
 - **职责**：左上角文字：`f=N/T cands=C tracks=K champ=#ID len=L bounces=B`。
 - **打开 debug 模式**可叠加：player bbox、运动掩码、候选框。
 
+#### `action.py` — 球员 bbox + 击球标签叠加
+- **职责**：Pass 2 渲染层消费 `stroke_events`，为每个 track ID 叠加：
+  1. **彩色 bbox**（`draw_players`）—— 颜色通过 track_id 做黄金比例 HSV 哈希，同一球员跨帧颜色稳定。
+  2. **击球标签**（`draw_stroke_labels`）—— 在 bbox 上方显示最近一次击球类型（`backhand / forehand / serve`），线性淡出，TTL = 2 秒。
+- **实现细节**：事件按 player_id 分组并按 frame 排序一次（`events_by_player_sorted`），Pass 2 每帧用 `bisect` 查找最近事件，O(log n)。
+
 ---
 
 ### `tennisvision/action/` —— 球员检测、姿态与击球分类（V3）
@@ -289,7 +318,7 @@ tennisvision/
 - **Keras 兼容**：`tennis_rnn.h5` 是 Keras 2 保存的，GRU 带 `time_major` kwarg，Keras 3 (TF ≥ 2.16) 拒绝加载。代码优先 `import tf_keras`（Keras 2 compat 包），不可用时再 fallback 到 Keras 3。
 
 #### 在 pipeline 中的位置
-在 `pipeline/analyze.py:_build_stroke_recognizer` 按配置构造对应对象；Pass 1 每帧调 `stroke_rec.push_frame(frame, frame_idx)`，事件追加到 `AnalyzeResult.stroke_events`。Pass 1 结束后会打印一次汇总（按 label 和按 player_id 分组计数）。Pass 2 的渲染**目前还没用到** stroke events —— 后续可以叠加到 HUD / minimap。
+在 `pipeline/analyze.py:_build_stroke_recognizer` 按配置构造对应对象；Pass 1 每帧调 `stroke_rec.push_frame(frame, frame_idx)`，事件追加到 `AnalyzeResult.stroke_events`，同时把 `last_detections`（本帧 bbox 字典）存入 `_FrameState.player_bboxes`，避免 Pass 2 重跑检测器。Pass 1 结束后会打印一次汇总（按 label 和按 player_id 分组计数）。**Pass 2** 用 `render/action.py` 中的 `draw_players` + `draw_stroke_labels` 将 bbox 和击球标签叠加到输出视频。
 
 ---
 
@@ -302,9 +331,11 @@ tennisvision/
 for frame in video:
     candidates  = ball_detector.detect(frame)
     tracker.update(candidates, frame_idx)
-    player_bboxes = player_detector.detect(frame)   # 可选
+    player_bboxes = player_detector.detect(frame)   # 可选，存入 frame_states
 trajectory = tracker.extract_champion_trajectory()
-bounces    = bounce_detector.detect(trajectory)
+# 可选：InpaintNet 填充 validated tracks 内部空洞
+tracks     = inpainter.fill_gaps(tracks)            # ball.inpainter.enabled
+bounces    = bounce_detector.detect(tracks)
 ```
 
 **Pass 2 — 渲染**
@@ -312,6 +343,8 @@ bounces    = bounce_detector.detect(trajectory)
 for frame in video:
     vis = frame.copy()
     render.trail(vis, trajectory, frame_idx)
+    render.players(vis, frame_states[frame_idx].player_bboxes)   # 可选
+    render.stroke_labels(vis, stroke_events, frame_idx)          # 可选
     render.minimap(vis, bounces, frame_idx, H_inv)
     render.hud(vis, stats)
     writer.write(vis)
@@ -421,7 +454,7 @@ python scripts/analyze.py \
     --bounce-detector catboost
 ```
 
-默认只跑球。加上 `--config configs/remote_action.yaml` 或在自己的 yaml 里设 `action.enabled: true` 会在 Pass 1 同时跑球员检测 + 姿态 + 击球分类，终端日志会多出：
+默认只跑球。加上 `--config configs/remote_inpaint.yaml`（或自定义 yaml）可启用 InpaintNet + action 全路线，终端日志会多出：
 
 ```
 [action] stroke classifier enabled (multi-player, window=30, min_conf=0.90)
@@ -466,6 +499,14 @@ tracker:
   min_speed: 10
   max_speed: 150
 
+inpainter:                     # TrackNetV3 InpaintNet 轨迹补洞（默认关）
+  enabled: false               # true → 在 bounce 检测前填充 validated track 空洞
+  weights: weights/InpaintNet_best.pt
+  device: cpu
+  window_mode: single          # single | nonoverlap
+  max_gap_frames: 60           # 超过此值的空洞不填（跨 rally）
+  th_h_frac: 0.05              # 视野外 y 阈值（帧高比例）
+
 bounce:
   detector: catboost             # peak | catboost
   weights: weights/bounce_catboost.cbm
@@ -497,7 +538,7 @@ debug:
   dir: null                       # 设为路径开启 debug 输出
 ```
 
-开启 action 路线的一个示例见 [`configs/remote_action.yaml`](configs/remote_action.yaml)（远程测试机用的配置，权重路径指向 `/root/personal/`）。
+开启 InpaintNet + action 全路线的示例见 [`configs/remote_inpaint.yaml`](configs/remote_inpaint.yaml)（远程测试机用的配置，权重路径指向 `/root/personal/`）。
 
 每个模块接受的参数都可在此覆盖。
 
@@ -526,14 +567,14 @@ debug:
 ### V2 — 部分完成（深度学习球检测与轨迹）
 - [x] 采用 **WASB-SBDT**（MIT 许可，BMVC 2023）作为默认 detector（`ball/wasb.py`）
 - [x] 首次运行自动导出 ONNX + ONNXRuntime CPU 推理（`ball/wasb.py`，~100–200 ms/帧 CPU）
-- [ ] 集成 **TrackNetV3 的 InpaintNet** —— 把 WASB 吐出的带 gap 的轨迹喂给学习式 inpainter，替代/增强当前的 Kalman 补洞。目的是解决跨球员 / 网前遮挡时 champion track 丢失的问题
+- [x] 集成 **TrackNetV3 的 InpaintNet**（`ball/inpainter.py`）—— 可选填充 validated track 内部空洞；逐 Track 运行避免跨 rally 误桥接；`ball.inpainter.enabled=false` 时零开销
 - [ ] 性能基准：Pass 1 端到端目标 CPU 5 fps（含 action 路线）
 
 ### V3 — 长期（物理级准确）
 - [x] **球员检测 + 多目标跟踪**（`action/player.py`）：YOLOv8n + ByteTrack + on-court 过滤（投影 bbox 底部 → 只保留脚在场地内的人）
 - [x] **球员姿态**（`action/pose.py`）：MoveNet SinglePose Lightning fp16 TFLite，ROI-based（接在 YOLOv8 bbox 后）
 - [x] **击球分类**（`action/stroke_classifier.py`）：30 帧滑窗 + Keras GRU → backhand / forehand / neutral / serve，每个 track ID 一条独立滑窗
-- [ ] Pass 2 渲染层消费 `stroke_events`（画击球标注 / HUD 统计）
+- [x] Pass 2 渲染层消费 `stroke_events`（`render/action.py`：ball player bbox + 击球标签叠加，2 s TTL 淡出）
 - [ ] 击球与落点的配对（正手打出 → 落点位置 → 战术统计）
 - [ ] 3D EKF（参考 Tennis3DTracker）：真正的 3D 轨迹 + 物理 bounce（z=0 交越）
 - [ ] 热力图、统计报告、多摄像机融合

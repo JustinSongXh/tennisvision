@@ -205,15 +205,20 @@ class MultiPlayerStrokeRecognizer:
         self._model = _load_keras_model(cfg.weights)
         self._states: dict = {}      # track_id -> _PlayerState
         self._last_seen: dict = {}   # track_id -> frame_idx
+        # Exposed so the pipeline can render per-frame bboxes without
+        # re-running the detector.  Populated on every push_frame() call.
+        self.last_detections: dict = {}
 
     def reset(self) -> None:
         self._states.clear()
         self._last_seen.clear()
+        self.last_detections = {}
         self.player_det.reset()
 
     def push_frame(self, frame: np.ndarray, frame_idx: int) -> list:
         H, W = frame.shape[:2]
         detections = self.player_det.detect(frame, frame_idx)  # {tid: (x0,y0,x1,y1)}
+        self.last_detections = detections
 
         # GC tracks that have been absent for a while.
         for tid in list(self._states.keys()):

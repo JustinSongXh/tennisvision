@@ -1,0 +1,21 @@
+# Remote test config with InpaintNet trajectory gap-filling enabled.
+# Keeps action (player / pose / stroke) on for the same A/B baseline.
+# Weights staged at /root/personal/, not repo weights/.
+ball:
+  weights: weights/wasb_tennis_best.pth.tar
+bounce:
+  weights: weights/bounce_catboost.cbm
+inpainter:
+  enabled: true
+  weights: weights/InpaintNet_best.pt
+  device: cpu
+  window_mode: single        # single-pass (fully-conv model, no seam artifacts)
+  max_gap_frames: 60         # skip gaps longer than this
+  th_h_frac: 0.05            # out-of-view threshold as fraction of frame height
+action:
+  enabled: true
+  movenet_tflite: /root/personal/movenet_lightning_f16.tflite
+  rnn_weights:   /root/personal/tennis_rnn.h5
+  player:
+    enabled: true
+    weights:     /root/personal/yolov8n.pt
