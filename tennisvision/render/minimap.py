@@ -65,7 +65,9 @@ class Minimap:
                frame_idx: int) -> np.ndarray:
         mm = self._template.copy()
         for x_m, y_m, f in bounces:
-            age = max(0, frame_idx - f)
+            if f > frame_idx:
+                continue
+            age = frame_idx - f
             fade = max(0.3, 1.0 - age / float(self.cfg.fade_frames))
             col = (int(30 * (1 - fade) + 30),
                    int(30 * (1 - fade) + 30),

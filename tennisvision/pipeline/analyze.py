@@ -54,6 +54,64 @@ class AnalyzeResult:
     total_frames: int
     bounces: int
     validated_tracks: int
+    stroke_events: list = field(default_factory=list)
+
+
+def _build_stroke_recognizer(acfg, calib=None):
+    """Return an object with `push_frame(frame, frame_idx) -> list[StrokeEvent]`,
+    or None if action.enabled is false.
+
+    When `action.player.enabled` (default) → MultiPlayerStrokeRecognizer,
+    singles and doubles handled identically by YOLOv8 tracking.
+    When false → single-player full-frame fallback (debug / single-player clips).
+
+    All heavy deps (tensorflow, ultralytics) are imported lazily so
+    ball-only runs don't pay for them.
+    """
+    if not acfg or not acfg.get("enabled"):
+        return None
+    from ..action.pose import MoveNetConfig, MoveNetPoseExtractor
+    from ..action.stroke_classifier import (
+        MultiPlayerStrokeRecognizer,
+        StrokeClassifier,
+        StrokeClassifierConfig,
+    )
+
+    pose = MoveNetPoseExtractor(MoveNetConfig(
+        weights=acfg["movenet_tflite"],
+        score_threshold=acfg.get("score_threshold", 0.2),
+    ))
+    cls_cfg = StrokeClassifierConfig(
+        weights=acfg["rnn_weights"],
+        window_frames=acfg["window_frames"],
+        labels=tuple(acfg["labels"]),
+        min_confidence=acfg["min_confidence"],
+        stride=acfg.get("stride", 5),
+        emit_neutral=acfg.get("emit_neutral", False),
+    )
+
+    pcfg = acfg.get("player", {})
+    if pcfg.get("enabled", True):
+        from ..action.player import PlayerDetector, PlayerDetectorConfig
+        det = PlayerDetector(
+            PlayerDetectorConfig(
+                weights=pcfg["weights"],
+                device=pcfg.get("device", "cpu"),
+                conf=pcfg.get("conf", 0.4),
+                iou=pcfg.get("iou", 0.5),
+                tracker=pcfg.get("tracker", "bytetrack.yaml"),
+                imgsz=pcfg.get("imgsz", 640),
+                min_bbox_h=pcfg.get("min_bbox_h", 60),
+                max_persons=pcfg.get("max_persons", 4),
+                court_margin_m=pcfg.get("court_margin_m", 3.0),
+            ),
+            calib=calib,
+        )
+        return MultiPlayerStrokeRecognizer(
+            cls_cfg, pose, det,
+            track_ttl_frames=pcfg.get("track_ttl_frames", 30),
+        )
+    return StrokeClassifier(cls_cfg, pose)
 
 
 def _build_ball_detector(bcfg):
@@ -169,6 +227,15 @@ def run(
         fade_frames=rcfg["bounce_fade_frames"],
     ))
 
+    stroke_rec = _build_stroke_recognizer(cfg.get("action"), calib=calib)
+    stroke_events: list = []
+    if stroke_rec is not None:
+        mode = "multi-player" if cfg["action"].get("player", {}).get("enabled", True) \
+            else "full-frame single-player"
+        print("[action] stroke classifier enabled (%s, window=%d, min_conf=%.2f)"
+              % (mode, cfg["action"]["window_frames"], cfg["action"]["min_confidence"]),
+              flush=True)
+
     # ------------------------------------------------------------------
     # PASS 1 — tracking only; remember per-frame state + retired tracks
     # ------------------------------------------------------------------
@@ -206,6 +273,9 @@ def run(
             if tid not in after_ids and t.validated:
                 retired_tracks[tid] = t
 
+        if stroke_rec is not None:
+            stroke_events.extend(stroke_rec.push_frame(frame, frame_idx))
+
         fs = _FrameState(n_cands=len(cand_xys), n_tracks=len(tracker.tracks))
         if champion is not None:
             fs.champion_id = champion.id
@@ -228,6 +298,22 @@ def run(
     print("[pass 1] done in %.1fs  (%d validated tracks)" %
           (time.time() - t0, sum(1 for t in retired_tracks.values() if t.validated)),
           flush=True)
+
+    if stroke_rec is not None:
+        by_label: dict = {}
+        by_player: dict = {}
+        for ev in stroke_events:
+            by_label[ev.label] = by_label.get(ev.label, 0) + 1
+            if ev.player_id is not None:
+                by_player.setdefault(ev.player_id, {})
+                by_player[ev.player_id][ev.label] = \
+                    by_player[ev.player_id].get(ev.label, 0) + 1
+        label_summary = ", ".join("%s=%d" % kv for kv in sorted(by_label.items())) or "(none)"
+        print("[action] %d stroke events: %s" % (len(stroke_events), label_summary),
+              flush=True)
+        for pid in sorted(by_player.keys()):
+            parts = ", ".join("%s=%d" % kv for kv in sorted(by_player[pid].items()))
+            print("[action]   player #%d: %s" % (pid, parts), flush=True)
 
     # Also include tracks still alive after the last frame
     for t in tracker.tracks:
@@ -269,11 +355,13 @@ def run(
             draw_trail(vis, pts_obj, frame_idx,
                        tail=tail_len, is_current_det=fs.is_current_det)
         minimap.overlay(vis, bounces_court, frame_idx)
+        n_shown = sum(1 for _, _, f in bounces_court if f <= frame_idx)
 
         champ_info = "-" if fs.champion_id is None \
             else "#%d len=%d" % (fs.champion_id, len(fs.champion_trail))
-        hud = "f=%d/%d cands=%d tracks=%d champ=%s bounces=%d" % (
-            frame_idx, total, fs.n_cands, fs.n_tracks, champ_info, len(bounces_court))
+        hud = "f=%d/%d cands=%d tracks=%d champ=%s bounces=%d/%d" % (
+            frame_idx, total, fs.n_cands, fs.n_tracks, champ_info,
+            n_shown, len(bounces_court))
         draw_hud(vis, hud)
 
         out.write(vis)
@@ -293,4 +381,5 @@ def run(
         total_frames=frame_idx,
         bounces=len(bounces_court),
         validated_tracks=len(all_tracks),
+        stroke_events=stroke_events,
     )

@@ -12,6 +12,7 @@
 ## 目录
 
 - [设计原则](#设计原则)
+- [方案矩阵](#方案矩阵)
 - [目录结构](#目录结构)
 - [模块详解](#模块详解)
 - [数据流](#数据流)
@@ -35,6 +36,25 @@
 
 ---
 
+## 方案矩阵
+
+一张表回答"每个模块有哪些实现 / 哪个是默认 / 需要什么权重"。详细原理与对比在[模块详解](#模块详解)里展开。
+
+| 模块 | 可选实现 | 默认 | 权重文件 |
+|---|---|---|---|
+| **球场标定** (`scripts/calibrate.py`) | `mark` — 手画红线图 / `blue` — 蓝色轮廓 / `tcd` — TennisCourtDetector CNN | `mark` | `tcd` 需 `weights/court_tcd.pt`；`mark`/`blue` 无 |
+| **球检测** (`ball.detector`) | `classical` — HSV + MOG2 / `wasb` — WASB HRNet | **`wasb`** | `wasb_tennis_best.pth.tar`（首次运行自动导出为 `.onnx`） |
+| **球轨迹** | 多目标 Kalman + champion 选择 | 唯一 | 无 |
+| **落点检测** (`bounce.detector`) | `peak` — y 方向极值 baseline / `catboost` — 轨迹特征分类器 | **`catboost`** | `bounce_catboost.cbm` |
+| **球员检测** (`action.player.enabled`) | YOLOv8n + ByteTrack（`true`） / 关闭后退为全帧单人（`false`） | `true` | `yolov8n.pt` |
+| **球员姿态** | MoveNet SinglePose Lightning fp16 TFLite | 唯一 | `movenet_lightning_f16.tflite` |
+| **击球分类** (`action.enabled`) | 30 帧滑窗 + Keras GRU（默认关闭，需显式开启） | 关闭 | `tennis_rnn.h5`（需 `tf-keras` 加载） |
+| **渲染** | trail / minimap / hud，固定组合 | 唯一 | 无 |
+
+> **切换实现方式**：写一份 `configs/your.yaml` 覆盖对应字段，如 `ball.detector: classical` 或 `action.enabled: true`，运行时传 `--config configs/your.yaml`。完整字段见 [`tennisvision/config.py:DEFAULTS`](tennisvision/config.py)。
+
+---
+
 ## 目录结构
 
 ```
@@ -47,9 +67,12 @@ tennisvision/
 │   └── default.yaml                 # 默认 pipeline 配置
 │
 ├── weights/                         # 模型权重（gitignored）
-│   ├── court_tcd.pt                 # TennisCourtDetector
-│   ├── tracknet.pt                  # yastrebksv TrackNet（或 WASB）
-│   └── bounce_catboost.cbm          # CatBoost 落点分类器
+│   ├── court_tcd.pt                 # TennisCourtDetector（标定可选）
+│   ├── wasb_tennis_best.pth.tar     # WASB HRNet 球检测（首次运行自动导出 .onnx）
+│   ├── bounce_catboost.cbm          # CatBoost 落点分类器
+│   ├── yolov8n.pt                   # YOLOv8n 球员检测（ultralytics 首次运行也会自动下）
+│   ├── movenet_lightning_f16.tflite # MoveNet 球员姿态
+│   └── tennis_rnn.h5                # 击球分类 GRU (antoinekeller, Keras 2)
 │
 ├── docs/
 │   ├── court_detection_survey.md    # 开源项目调研
@@ -82,6 +105,12 @@ tennisvision/
 │   │   ├── minimap.py               # 右侧 mini-map
 │   │   ├── trail.py                 # 球轨迹叠加
 │   │   └── hud.py                   # 文字 HUD
+│   │
+│   ├── action/                      # 球员姿态 + 击球分类（V3）
+│   │   ├── __init__.py
+│   │   ├── player.py                # YOLOv8 + ByteTrack 球员检测/跟踪 + on-court 过滤
+│   │   ├── pose.py                  # MoveNet TFLite 姿态提取
+│   │   └── stroke_classifier.py     # 单/多人 30 帧滑窗 GRU
 │   │
 │   └── pipeline/                    # 编排
 │       ├── __init__.py
@@ -228,6 +257,42 @@ tennisvision/
 
 ---
 
+### `tennisvision/action/` —— 球员检测、姿态与击球分类（V3）
+
+整个模块默认**关闭**（`action.enabled=false`），开启后在 Pass 1 里和球检测并行跑。所有重依赖（`tensorflow` / `tf-keras` / `ultralytics` / `tflite-runtime`）都是懒加载，只跑球不会付出这部分开销。
+
+#### `player.py` — 球员检测 + 多目标跟踪
+- **职责**：每帧返回 `{track_id: (x0, y0, x1, y1)}`，跨帧稳定的持久化 ID。
+- **算法**：ultralytics YOLOv8n（person-only）+ 内置 ByteTrack/BoTSORT `.track(persist=True)`。单打自然得到 2 个 ID，双打 4 个，不需特判。
+- **旁观者（教练 / 球童 / 观众）过滤**，分三层：
+  1. `min_bbox_h`（默认 60 px）—— 丢弃画面里远处 / 极小的人
+  2. **on-court 过滤** —— 把 bbox 底部中心经标定 H 投影到球场平面，只保留脚落在 `[-margin, 场地+margin]` 米范围内的人（默认 `court_margin_m=3.0`，留出底线跟步 / 热身的余量；发现有人混入可收紧到 1.0）
+  3. `max_persons` —— 按置信度排序取前 N（默认 4；双打 + 教练用 5–6，单打防误入可设 2）
+- **无 `calib` 时**：on-court 过滤自动降级为"全接受"，便于在未标定视频上调试。
+
+#### `pose.py` — MoveNet 姿态提取
+- **职责**：给一帧 + 一个 ROI（球员 bbox），输出 17 个 COCO 关键点 `(y_px, x_px, score)` 的**原图像素坐标**。
+- **实现**：Google MoveNet SinglePose Lightning fp16 TFLite，192×192 输入。预处理用 `letterbox`（等比缩放 + 黑边填充），保证姿态不因强制方形缩放而走形，推理后反投影回原图。
+- **运行时**：优先 `tflite_runtime`（轻量），回退到 `tensorflow.lite`。
+
+#### `stroke_classifier.py` — 滑窗 GRU 击球分类
+- **职责**：维护每个球员的 pose 滑窗，定期喂模型，输出 `StrokeEvent(frame, label, confidence, cx, cy, player_id)`。
+- **两种入口**：
+  - `StrokeClassifier` —— 单球员全帧 fallback，给单人 clip / 调试用
+  - `MultiPlayerStrokeRecognizer` —— 以 `PlayerDetector` 的 track ID 为 key，每个 ID 一条独立滑窗；单打 / 双打同一份代码
+- **算法**（移植自 [antoinekeller/tennis_shot_recognition](https://github.com/antoinekeller/tennis_shot_recognition)）：
+  1. 每帧取 pose 的 13 个 COCO 关键点（去掉眼 / 耳）→ 26 维 `(y, x)` 特征
+  2. **关键点相对 bbox 归一化**（而非相对整帧）—— 否则特征会编码"球员在场地哪里"，模型把位置当噪声，分类崩掉
+  3. 30 帧滑窗（≈1 s @ 30 fps）→ Keras GRU → softmax 4 类（`backhand / forehand / neutral / serve`）
+  4. 置信度阈值 `min_confidence=0.9` + `stride=5` 避免重复触发 + 可选抑制 `neutral`
+- **track TTL**：track 短暂消失（<30 帧，例如被网挡一下）不重置该球员的滑窗，避免瞬时漏检打断识别。
+- **Keras 兼容**：`tennis_rnn.h5` 是 Keras 2 保存的，GRU 带 `time_major` kwarg，Keras 3 (TF ≥ 2.16) 拒绝加载。代码优先 `import tf_keras`（Keras 2 compat 包），不可用时再 fallback 到 Keras 3。
+
+#### 在 pipeline 中的位置
+在 `pipeline/analyze.py:_build_stroke_recognizer` 按配置构造对应对象；Pass 1 每帧调 `stroke_rec.push_frame(frame, frame_idx)`，事件追加到 `AnalyzeResult.stroke_events`。Pass 1 结束后会打印一次汇总（按 label 和按 player_id 分组计数）。Pass 2 的渲染**目前还没用到** stroke events —— 后续可以叠加到 HUD / minimap。
+
+---
+
 ### `tennisvision/pipeline/analyze.py` —— 编排
 
 **两遍流水线**（借鉴 CourtCheck）：
@@ -312,7 +377,9 @@ for frame in video:
 | `onnxruntime` | TrackNet 推理（比纯 torch 快 5–10×）|
 | `catboost` | 学习式落点检测 |
 | `scipy` | 三次样条插值（bounce 预处理） |
-| `ultralytics` | 未来加 YOLOv8 Pose 做球员姿态 |
+| `ultralytics` | YOLOv8n 球员检测 + ByteTrack 跟踪（`action.player.enabled`）|
+| `tflite-runtime` *或* `tensorflow` | MoveNet 姿态 TFLite 推理 |
+| `tensorflow` + `tf-keras` | 加载 `tennis_rnn.h5`（Keras 2 GRU）做击球分类 |
 
 `requirements.txt` 按"最小可运行集"+"扩展组"分两栏列出。
 
@@ -352,6 +419,15 @@ python scripts/analyze.py \
     --out   output.mp4 \
     --ball-detector tracknet \
     --bounce-detector catboost
+```
+
+默认只跑球。加上 `--config configs/remote_action.yaml` 或在自己的 yaml 里设 `action.enabled: true` 会在 Pass 1 同时跑球员检测 + 姿态 + 击球分类，终端日志会多出：
+
+```
+[action] stroke classifier enabled (multi-player, window=30, min_conf=0.90)
+[action] 42 stroke events: backhand=11, forehand=26, serve=5
+[action]   player #1: backhand=6, forehand=14, serve=3
+[action]   player #2: backhand=5, forehand=12, serve=2
 ```
 
 ### 调试
@@ -401,9 +477,27 @@ render:
   trail_length_frames: 45
   bounce_fade_frames: 600
 
+action:                          # 球员检测 + 姿态 + 击球分类（默认关）
+  enabled: false                 # true → Pass 1 多一路 pose + 分类
+  movenet_tflite: weights/movenet_lightning_f16.tflite
+  rnn_weights:    weights/tennis_rnn.h5
+  window_frames:  30             # 滑窗长度（30 ≈ 1s @ 30fps）
+  min_confidence: 0.9            # 低于此值不发事件
+  stride:         5              # 每球员最多 stride 帧推理一次
+  emit_neutral:   false
+  player:
+    enabled:      true           # false → 退化为全帧单人
+    weights:      weights/yolov8n.pt
+    conf:         0.4
+    max_persons:  4              # 双打+教练可放 5–6；单打收紧到 2
+    min_bbox_h:   60             # 丢弃远处 / 极小检测
+    court_margin_m: 3.0          # on-court 过滤容差（米）
+
 debug:
   dir: null                       # 设为路径开启 debug 输出
 ```
+
+开启 action 路线的一个示例见 [`configs/remote_action.yaml`](configs/remote_action.yaml)（远程测试机用的配置，权重路径指向 `/root/personal/`）。
 
 每个模块接受的参数都可在此覆盖。
 
@@ -429,16 +523,19 @@ debug:
 - [ ] **已知限制**：TCD 模型在广播视角（TV 转播机位）上训练，对我们业余场地的**低位偏左机位** recall 很低（0-3 keypoints/帧）。下个版本需要 fine-tune 或改用另外的权重
 - [ ] 单元测试
 
-### V2 — 中期（引入深度学习球检测）
-- [ ] 导出 TrackNet 到 **ONNX** + ONNXRuntime CPU 推理
-- [ ] 实现 `ball/tracknet.py` 并与现有 tracker 集成
-- [ ] 性能基准：目标 CPU 5–10 fps（离线批处理够用）
-- [ ] （可选）换 **WASB-SBDT**（MIT 许可，tennis 权重）
+### V2 — 部分完成（深度学习球检测与轨迹）
+- [x] 采用 **WASB-SBDT**（MIT 许可，BMVC 2023）作为默认 detector（`ball/wasb.py`）
+- [x] 首次运行自动导出 ONNX + ONNXRuntime CPU 推理（`ball/wasb.py`，~100–200 ms/帧 CPU）
+- [ ] 集成 **TrackNetV3 的 InpaintNet** —— 把 WASB 吐出的带 gap 的轨迹喂给学习式 inpainter，替代/增强当前的 Kalman 补洞。目的是解决跨球员 / 网前遮挡时 champion track 丢失的问题
+- [ ] 性能基准：Pass 1 端到端目标 CPU 5 fps（含 action 路线）
 
 ### V3 — 长期（物理级准确）
-- [ ] YOLOv8 Pose 检测球员姿态（击球判定）
+- [x] **球员检测 + 多目标跟踪**（`action/player.py`）：YOLOv8n + ByteTrack + on-court 过滤（投影 bbox 底部 → 只保留脚在场地内的人）
+- [x] **球员姿态**（`action/pose.py`）：MoveNet SinglePose Lightning fp16 TFLite，ROI-based（接在 YOLOv8 bbox 后）
+- [x] **击球分类**（`action/stroke_classifier.py`）：30 帧滑窗 + Keras GRU → backhand / forehand / neutral / serve，每个 track ID 一条独立滑窗
+- [ ] Pass 2 渲染层消费 `stroke_events`（画击球标注 / HUD 统计）
+- [ ] 击球与落点的配对（正手打出 → 落点位置 → 战术统计）
 - [ ] 3D EKF（参考 Tennis3DTracker）：真正的 3D 轨迹 + 物理 bounce（z=0 交越）
-- [ ] 击球分类（正手/反手/发球）via 姿态时序分类
 - [ ] 热力图、统计报告、多摄像机融合
 
 ### 非目标
@@ -451,15 +548,17 @@ debug:
 ## 参考
 
 ### 直接借鉴的项目
+- **[nttcom/WASB-SBDT](https://github.com/nttcom/WASB-SBDT)** —— **当前球检测**（HRNet，MIT 许可，BMVC 2023）；`ball/wasb.py` + `ball/hrnet.py` 复用其代码与 tennis 权重。
 - **[CourtCheck](https://github.com/AggieSportsAnalytics/CourtCheck)** —— 整体 pipeline 分层、best-of-subsets homography、CatBoost 落点。
-- **[yastrebksv/TennisProject](https://github.com/yastrebksv/TennisProject)** —— TrackNet + 14 点球场 + CatBoost bounce 的参考实现。
+- **[yastrebksv/TennisProject](https://github.com/yastrebksv/TennisProject)** —— 14 点球场 + CatBoost bounce 参考实现。
 - **[yastrebksv/TennisCourtDetector](https://github.com/yastrebksv/TennisCourtDetector)** —— 15 通道 heatmap 球场检测模型，预训练权重开放。
-- **[yastrebksv/TrackNet](https://github.com/yastrebksv/TrackNet)** —— 业界标准球追踪 CNN。
+- **[antoinekeller/tennis_shot_recognition](https://github.com/antoinekeller/tennis_shot_recognition)** —— 30 帧滑窗 GRU 击球分类（`tennis_rnn.h5`）。
+- **[Google MoveNet](https://www.tensorflow.org/hub/tutorials/movenet)** —— SinglePose Lightning fp16 TFLite，姿态提取。
 
-### 更前沿的替代
-- **[nttcom/WASB-SBDT](https://github.com/nttcom/WASB-SBDT)** —— MIT 许可的小球检测 SOTA（BMVC 2023）。
-- **[qaz812345/TrackNetV3](https://github.com/qaz812345/TrackNetV3)** —— TrackNet + InpaintNet 轨迹补洞。
-- **[John-Boccio/Tennis3DTracker](https://github.com/John-Boccio/Tennis3DTracker)** —— 单目 3D EKF 重建。
+### 候选替代 / 未采用
+- **[yastrebksv/TrackNet](https://github.com/yastrebksv/TrackNet)** —— 业界标准球追踪 CNN；更大（~11M 参数）、tennis-only，被 WASB 在同基准上超过，故未采用。
+- **[qaz812345/TrackNetV3](https://github.com/qaz812345/TrackNetV3)** —— TrackNet + **InpaintNet**（学习式轨迹补洞）。TrackerNet 那端我们用 WASB 替代；**InpaintNet 仍是 V2 的增量目标**（见路线图）。
+- **[John-Boccio/Tennis3DTracker](https://github.com/John-Boccio/Tennis3DTracker)** —— 单目 3D EKF 重建（V3 远期）。
 
 ### 文档
 - [docs/court_detection_survey.md](docs/court_detection_survey.md) —— 完整调研笔记（含各方案对比、权重下载链、选型建议）。

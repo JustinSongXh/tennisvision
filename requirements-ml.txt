@@ -12,3 +12,10 @@ scipy>=1.5
 # Uncomment whichever applies:
 # onnxruntime>=1.15
 # onnxruntime-openvino>=1.15
+
+# --- V3: stroke classification (tennisvision/action/) ---
+# YOLOv8 person tracking + MoveNet TFLite pose + Keras GRU stroke classifier
+# (forehand/backhand/serve). Uncomment if you set action.enabled=true.
+# tensorflow>=2.10        # covers both the .h5 Keras model AND the TFLite interpreter
+# ultralytics>=8.0        # YOLOv8 person detection + ByteTrack tracking
+# tflite-runtime>=2.10    # lighter alternative IF you only need MoveNet (not the .h5 RNN)

@@ -60,6 +60,36 @@ DEFAULTS: dict = {
         "minimap_margin_px": 15,
         "bounce_fade_frames": 600,
     },
+    "action": {
+        "enabled": False,
+        "movenet_tflite": "weights/movenet_lightning_f16.tflite",
+        "rnn_weights": "weights/tennis_rnn.h5",
+        "window_frames": 30,
+        "labels": ["backhand", "forehand", "neutral", "serve"],
+        "min_confidence": 0.9,
+        "stride": 5,
+        "emit_neutral": False,
+        "score_threshold": 0.2,
+        # Per-player detection. enabled=false falls back to full-frame
+        # single-player (only useful for debugging / single-player clips).
+        "player": {
+            "enabled": True,
+            "weights": "weights/yolov8n.pt",
+            "device": "cpu",
+            "conf": 0.4,
+            "iou": 0.5,
+            "tracker": "bytetrack.yaml",
+            "imgsz": 640,
+            "min_bbox_h": 60,
+            "max_persons": 4,             # 2 singles / 4 doubles / coach → clamp high
+            "track_ttl_frames": 30,
+            # On-court filter: keep persons whose foot (bbox bottom-center)
+            # projects inside [-margin, court+margin] meters via calib
+            # homography.  Lower to e.g. 1.0 if bystanders keep slipping
+            # in; raise if you see real players being rejected.
+            "court_margin_m": 3.0,
+        },
+    },
     "debug": {
         "dir": None,
     },
