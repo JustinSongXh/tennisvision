@@ -15,6 +15,6 @@ inpainter:
 action:
   enabled: true
   pose_weights: /root/personal/yolo26n-pose.pt
-  pose_device:  cuda            # cpu | cuda
+  pose_device:  cpu             # cpu | cuda
   rnn_weights:  /root/personal/tennis_rnn.h5
   player: {}
