@@ -58,6 +58,44 @@ class Calibration:
         )
 
 
+    def court_h_strip_mask(self, W: int, H: int, margin_px: int = 30) -> np.ndarray:
+        """Binary mask (H×W uint8=255) that keeps only the horizontal band
+        between the left and right doubles sidelines projected onto the image.
+
+        Vertical extent is NOT constrained — the ball can fly above the
+        court baseline or out of frame.  Only the left/right sidelines are
+        used, eliminating adjacent-court interference.
+
+        The mask is computed once per calibration and can be cached.
+        """
+        from .reference import COURT_WIDTH_M, COURT_LENGTH_M
+
+        def _proj_m(xm: float, ym: float) -> tuple[float, float]:
+            v = np.array([xm, ym, 1.0])
+            p = self.H_real_to_img @ v
+            return float(p[0] / p[2]), float(p[1] / p[2])
+
+        # Two points on each sideline span the full court depth
+        left_pts  = [_proj_m(0.0,           0.0),
+                     _proj_m(0.0,           COURT_LENGTH_M)]
+        right_pts = [_proj_m(COURT_WIDTH_M, 0.0),
+                     _proj_m(COURT_WIDTH_M, COURT_LENGTH_M)]
+
+        # Fit x = a*y + b for each sideline
+        lfit = np.polyfit([p[1] for p in left_pts],  [p[0] for p in left_pts],  1)
+        rfit = np.polyfit([p[1] for p in right_pts], [p[0] for p in right_pts], 1)
+
+        ys = np.arange(H, dtype=np.float32)
+        xl = (np.polyval(lfit, ys) - margin_px).astype(int).clip(0, W - 1)
+        xr = (np.polyval(rfit, ys) + margin_px).astype(int).clip(0, W - 1)
+
+        mask = np.zeros((H, W), dtype=np.uint8)
+        for y in range(H):
+            if xr[y] > xl[y]:
+                mask[y, xl[y]: xr[y] + 1] = 255
+        return mask
+
+
 def save(calib: Calibration, path: str) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w") as f:

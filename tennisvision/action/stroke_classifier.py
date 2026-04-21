@@ -49,6 +49,8 @@ class StrokeClassifierConfig:
     stride: int = 5                    # run inference at most every `stride` frames per track
     emit_neutral: bool = False         # if False, suppress neutral-class events
     normalize_by_frame_size: bool = True  # divide (y, x) by (H, W) before buffering
+    ball_proximity_px: float = 300.0   # skip RNN inference when ball is farther than this
+                                       # (feature window still accumulates); 0 = disabled
 
 
 @dataclass
@@ -212,7 +214,8 @@ class MultiPlayerStrokeRecognizer:
         self.last_detections = {}
         self.pose_tracker.reset()
 
-    def push_frame(self, frame: np.ndarray, frame_idx: int) -> list:
+    def push_frame(self, frame: np.ndarray, frame_idx: int,
+                   ball_xy: Optional[Tuple[float, float]] = None) -> list:
         # {tid: (bbox, Pose)} — single model call covers detection+pose.
         tracked = self.pose_tracker.push_frame(frame, frame_idx)
         self.last_detections = {tid: bbox for tid, (bbox, _) in tracked.items()}
@@ -243,6 +246,16 @@ class MultiPlayerStrokeRecognizer:
                 continue
             if frame_idx - st.last_infer_frame < self.cfg.stride:
                 continue
+
+            # Skip RNN when ball is far from this player — accumulate the
+            # window so history is ready when the player does make contact.
+            if ball_xy is not None and self.cfg.ball_proximity_px > 0:
+                cx_ = 0.5 * (bbox[0] + bbox[2])
+                cy_ = 0.5 * (bbox[1] + bbox[3])
+                dist = ((cx_ - ball_xy[0]) ** 2 + (cy_ - ball_xy[1]) ** 2) ** 0.5
+                if dist > self.cfg.ball_proximity_px:
+                    continue
+
             st.last_infer_frame = frame_idx
 
             feats = np.stack([f for (_, f) in st.window], axis=0)

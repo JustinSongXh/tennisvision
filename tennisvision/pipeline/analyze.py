@@ -94,6 +94,7 @@ def _build_stroke_recognizer(acfg, calib=None):
         min_confidence=acfg["min_confidence"],
         stride=acfg.get("stride", 5),
         emit_neutral=acfg.get("emit_neutral", False),
+        ball_proximity_px=float(acfg.get("ball_proximity_px", 300)),
     )
 
     pcfg = acfg.get("player", {})
@@ -319,6 +320,21 @@ def run(
     H     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
+    # Precompute horizontal court strip mask to reject adjacent-court balls.
+    # Only left/right sidelines are enforced; vertical extent is unconstrained
+    # so balls that fly high or arc above the baseline are still captured.
+    _court_mask: Optional[np.ndarray] = None
+    _court_mask_margin = cfg.get("ball", {}).get("court_mask_margin_px", 30)
+    if _court_mask_margin > 0:
+        _court_mask = calib.court_h_strip_mask(W, H, margin_px=_court_mask_margin)
+
+    def _filter_cands(cands: list) -> list:
+        if _court_mask is None:
+            return cands
+        return [(x, y) for x, y in cands
+                if 0 <= int(y) < H and 0 <= int(x) < W
+                and _court_mask[int(y), int(x)] > 0]
+
     frame_states: dict[int, _FrameState] = {}
     retired_tracks: dict[int, Track] = {}     # by track.id
     tail_len = tcfg["render_tail"]
@@ -336,7 +352,7 @@ def run(
         # snapshot track ids before update so we can detect retired ones
         before_ids = {t.id: t for t in tracker.tracks}
 
-        cand_xys = ball_detect_fn(frame)
+        cand_xys = _filter_cands(ball_detect_fn(frame))
         tracker.update(cand_xys, frame_idx)
         champion = tracker.champion(frame_idx)
 
@@ -346,7 +362,12 @@ def run(
                 retired_tracks[tid] = t
 
         if stroke_rec is not None:
-            stroke_events.extend(stroke_rec.push_frame(frame, frame_idx))
+            ball_xy: Optional[tuple] = None
+            if champion is not None and champion.pts:
+                last_pt = champion.pts[-1]
+                ball_xy = (last_pt.x, last_pt.y)
+            stroke_events.extend(stroke_rec.push_frame(frame, frame_idx,
+                                                        ball_xy=ball_xy))
 
         fs = _FrameState(n_cands=len(cand_xys), n_tracks=len(tracker.tracks))
         if champion is not None:

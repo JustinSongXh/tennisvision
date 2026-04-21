@@ -86,6 +86,7 @@ DEFAULTS: dict = {
         "min_confidence": 0.9,
         "stride": 5,
         "emit_neutral": False,
+        "ball_proximity_px": 300,      # skip RNN when ball is >N px from player; 0=off
         "score_threshold": 0.2,
         # Player filtering params (detection weights are now pose_weights above).
         "player": {
