@@ -93,7 +93,7 @@ DEFAULTS: dict = {
             "conf": 0.3,
             "iou": 0.5,
             "tracker": "bytetrack.yaml",
-            "imgsz": 640,
+            "imgsz": 1280,
             "min_bbox_h": 60,
             "max_persons": 4,             # 2 singles / 4 doubles / coach → clamp high
             "track_ttl_frames": 30,

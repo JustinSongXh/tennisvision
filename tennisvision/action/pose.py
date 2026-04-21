@@ -51,7 +51,7 @@ class YOLOPoseTrackerConfig:
     device: str = "cpu"           # "cpu" | "cuda" | "cuda:0"
     conf: float = 0.3
     iou: float = 0.5
-    imgsz: int = 640
+    imgsz: int = 1280             # 1280 detects far-side players (60px→80px in model)
     tracker: str = "bytetrack.yaml"
     score_threshold: float = 0.2  # per-keypoint visibility threshold (downstream)
     min_bbox_h: int = 60          # px — drop tiny / far detections
@@ -83,18 +83,6 @@ class YOLOPoseTracker:
         self.cfg = cfg
         self.calib = calib
         self._model = YOLO(cfg.weights)
-
-        # Net y-coordinate in image pixels — used to split near/far halves.
-        self._net_y_px: Optional[int] = None
-        if calib is not None:
-            try:
-                from ..court.reference import NET_Y, COURT_WIDTH_M
-                v = np.array([COURT_WIDTH_M / 2.0, NET_Y, 1.0])
-                p = calib.H_real_to_img @ v
-                self._net_y_px = int(p[1] / p[2])
-            except Exception:
-                pass
-
 
     def reset(self) -> None:
         try:
@@ -128,50 +116,6 @@ class YOLOPoseTracker:
             [kp_xy[:, 1], kp_xy[:, 0], kp_xy[:, 2]], axis=1
         ).astype(np.float32)
         return Pose(keypoints=kp_yx, frame_idx=frame_idx)
-
-    def _detect_far_half(
-        self, frame: np.ndarray, frame_idx: int
-    ) -> Dict[int, Tuple[Tuple[int, int, int, int], Pose]]:
-        """Crop the far half of the court (above net line), run predict()
-        without tracking, and return supplemental detections with synthetic
-        negative IDs so they never collide with ByteTrack positive IDs.
-        """
-        if self._net_y_px is None:
-            return {}
-        net_y = self._net_y_px
-        # Add a small margin below the net so players near the net are included.
-        crop_bot = min(frame.shape[0], net_y + 40)
-        crop = frame[0:crop_bot, :]
-        if crop.shape[0] < 20:
-            return {}
-
-        results = self._model.predict(
-            crop, verbose=False, classes=[0],
-            conf=self.cfg.conf, imgsz=self.cfg.imgsz,
-        )
-        r = results[0]
-        if r.boxes is None or len(r.boxes) == 0:
-            return {}
-
-        boxes = r.boxes.xyxy.cpu().numpy()
-        confs = r.boxes.conf.cpu().numpy()
-        kps   = r.keypoints.data.cpu().numpy() if r.keypoints is not None else None
-
-        out: Dict[int, Tuple[Tuple[int, int, int, int], Pose]] = {}
-        syn_id = -1
-        for idx in np.argsort(-confs):
-            x0, y0, x1, y1 = boxes[idx]
-            y1_orig = y1  # y1 is already relative to crop top (which is 0)
-            if (y1_orig - y0) < self.cfg.min_bbox_h * 0.5:  # looser for far side
-                continue
-            bbox = (int(x0), int(y0), int(x1), int(y1_orig))
-            if not self._on_court(bbox):
-                continue
-            kp_arr = kps[idx] if kps is not None else np.zeros((17, 3), np.float32)
-            pose = self._kp_to_pose(kp_arr, frame_idx)
-            out[syn_id] = (bbox, pose)
-            syn_id -= 1
-        return out
 
     # ------------------------------------------------------------------
     # Public API
@@ -219,12 +163,5 @@ class YOLOPoseTracker:
                 continue
             pose = self._kp_to_pose(kps[idx], frame_idx)
             out[int(ids[idx])] = (bbox, pose)
-
-        # Supplemental far-half detection for players on the far side of the
-        # net who appear too small for the full-frame YOLO call to catch.
-        far_extra = self._detect_far_half(frame, frame_idx)
-        for syn_id, det in far_extra.items():
-            if syn_id not in out:
-                out[syn_id] = det
 
         return out
