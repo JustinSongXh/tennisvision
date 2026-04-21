@@ -1,17 +1,32 @@
 #!/usr/bin/env python3
 """Court calibration CLI.
 
-Supported methods:
-  mark   : extract 4 doubles corners from a user-drawn red-line annotation image.
-  tcd    : (V1) run yastrebksv/TennisCourtDetector CNN on a video frame.
-  resnet : (V1) run CourtCheck-style ResNet50 + Linear(28).
+Three methods are supported:
+
+  mark         Manual: extract 4 doubles corners from a user-drawn red-line
+               annotation image. No ML weights needed.
+
+  blue-resnet  Automatic (recommended for amateur/ground-level footage):
+               detect blue court surface via HSV → perspective-warp to
+               rectified view → ResNet50 regression for all 14 keypoints.
+               Requires weights/court_resnet.pth.
+
+  tcd          Automatic (broadcast/elevated footage): run the
+               yastrebksv/TennisCourtDetector heatmap CNN directly on video
+               frames. Requires weights/court_tcd.pt.
+
+  blue         Automatic (no ML): blue-contour corner detection only.
+               Lower accuracy; useful when no ML weights are available.
 
 Examples:
-  # From a hand-marked reference image
+  # Recommended: automatic from video (amateur blue courts)
+  python scripts/calibrate.py blue-resnet --video tennis.mp4 --out calib.json
+
+  # Manual fallback from a hand-marked reference image
   python scripts/calibrate.py mark --image court_mark.jpg --out calib.json
 
-  # From a video frame using the CNN (V1)
-  python scripts/calibrate.py tcd --video tennis.mp4 --frame 0 --out calib.json
+  # Broadcast footage with TCD heatmap CNN
+  python scripts/calibrate.py tcd --video tennis.mp4 --out calib.json
 """
 
 from __future__ import annotations
@@ -116,169 +131,6 @@ def cmd_blue(args):
         print("wrote", args.vis)
 
 
-def cmd_blue_warp(args):
-    """Perspective-warp the court trapezoid to a rectangle, run TCD, then unproject.
-
-    1. Build accumulated blue mask → fit enclosing trapezoid (no padding,
-       bottom corners at frame edges so near players don't clip the region).
-    2. cv2.getPerspectiveTransform: trapezoid → rectangle (TCD input size).
-    3. Warp each sampled frame, run TCD, median-aggregate keypoints in warp space.
-    4. Apply inverse warp to bring keypoints back to original image coordinates.
-    5. Estimate homography and save calib.
-    """
-    from tennisvision.court.tcd_model import HeatmapDetector
-    from tennisvision.court.homography import estimate_homography
-
-    det_blue = BlueContourDetector()
-    sample, mask = det_blue.court_mask_from_video(args.video)
-    if sample is None or mask is None:
-        raise SystemExit("blue-contour mask failed")
-
-    H, W = sample.shape[:2]
-
-    # Fit trapezoid with NO padding — raw line-fit corners only
-    quad = _enclosing_trapezoid(mask, pad_frac=0.0, pad_const=0)
-    if quad is None:
-        raise SystemExit("could not fit enclosing trapezoid from blue mask")
-
-    tl, tr, _br, _bl = quad
-    bl = (0, H - 1)
-    br = (W - 1, H - 1)
-
-    # Perspective warp: trapezoid → rectangle matching TCD's native input size
-    out_w, out_h = args.warp_size
-    src = np.float32([tl, tr, br, bl])
-    dst = np.float32([[0, 0], [out_w - 1, 0],
-                      [out_w - 1, out_h - 1], [0, out_h - 1]])
-    M = cv2.getPerspectiveTransform(src, dst)
-    M_inv = np.linalg.inv(M)
-
-    if args.debug:
-        warped_sample = cv2.warpPerspective(sample, M, (out_w, out_h))
-        cv2.imwrite(args.debug, warped_sample)
-        # Also save the trapezoid outline on the original frame
-        trap_vis = sample.copy()
-        pts_vis = np.array([tl, tr, br, bl], dtype=np.int32)
-        cv2.polylines(trap_vis, [pts_vis], True, (0, 255, 0), 3)
-        for pt, name in zip([tl, tr, br, bl], ["TL", "TR", "BR", "BL"]):
-            cv2.circle(trap_vis, pt, 10, (0, 0, 255), -1)
-            cv2.putText(trap_vis, name, (pt[0] + 10, pt[1] - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-        cv2.imwrite(args.debug.replace(".jpg", "_trap.jpg"), trap_vis)
-        print("debug images written:", args.debug,
-              "and", args.debug.replace(".jpg", "_trap.jpg"))
-
-    # Multi-frame TCD aggregation in warped space
-    det_tcd = HeatmapDetector(weights=args.weights, device=args.device,
-                              low_thresh=args.tcd_thresh)
-    cap = cv2.VideoCapture(args.video)
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    frame_idxs = np.linspace(5, max(total - 5, 6), args.frames).astype(int)
-
-    all_dets: dict = {}
-    for fi in frame_idxs:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
-        ok, f = cap.read()
-        if not ok:
-            continue
-        warped_f = cv2.warpPerspective(f, M, (out_w, out_h))
-        for kid, (xw, yw) in det_tcd.detect(warped_f).items():
-            all_dets.setdefault(kid, []).append((xw, yw))
-    cap.release()
-
-    # Median in warp space, then inverse-project back to original
-    kps = {}
-    for kid, pts in all_dets.items():
-        xw = float(np.median([p[0] for p in pts]))
-        yw = float(np.median([p[1] for p in pts]))
-        pt_back = cv2.perspectiveTransform(
-            np.array([[[xw, yw]]], dtype=np.float32), M_inv)[0][0]
-        kps[kid] = (float(pt_back[0]), float(pt_back[1]))
-
-    print("TCD detected %d keypoints over %d frames: %s" %
-          (len(kps), len(frame_idxs), sorted(kps.keys())))
-
-    if len(kps) < 4:
-        raise SystemExit("only %d keypoints detected; need >=4" % len(kps))
-
-    hr = estimate_homography(kps, min_conf_count=4)
-    if hr is None:
-        raise SystemExit("could not fit homography from detected keypoints")
-
-    calib = Calibration.from_homography_result(
-        hr, image_size=(sample.shape[1], sample.shape[0]),
-        keypoints_img=kps, source="blue-warp-tcd",
-    )
-    save(calib, args.out)
-    print("wrote %s  (used subset %s, reprojection err %.2f m)" %
-          (args.out, hr.used_keypoints, hr.reprojection_error_m))
-    if args.vis:
-        _draw_verification(sample, calib, args.vis)
-        print("wrote", args.vis)
-
-
-def cmd_blue_trap(args):
-    """Blue-contour calibration with enclosing-trapezoid pre-filter.
-
-    Step 1: build accumulated blue mask (same as `blue` command).
-    Step 2: fit enclosing trapezoid to that mask; bottom corners extend
-            to frame edges so near-baseline players are excluded.
-    Step 3: AND the trapezoid mask with the accumulated blue mask.
-    Step 4: run corner detection on the filtered mask.
-    """
-    det = BlueContourDetector()
-    sample, mask = det.court_mask_from_video(args.video)
-    if sample is None or mask is None:
-        raise SystemExit("blue-contour mask failed")
-
-    H, W = sample.shape[:2]
-    quad = _enclosing_trapezoid(mask, pad_frac=args.pad_frac,
-                                pad_const=args.pad_const)
-    if quad is None:
-        raise SystemExit("could not fit enclosing trapezoid from blue mask")
-
-    tl, tr, _br, _bl = quad
-    pts = np.array([tl, tr, (W - 1, H - 1), (0, H - 1)], dtype=np.int32)
-    trap_mask = np.zeros((H, W), dtype=np.uint8)
-    cv2.fillPoly(trap_mask, [pts], 255)
-
-    # Apply trapezoid to the accumulated blue mask
-    filtered = cv2.bitwise_and(mask, mask, mask=trap_mask)
-
-    if args.debug:
-        dbg = sample.copy()
-        cv2.polylines(dbg, [pts], True, (0, 255, 0), 3)
-        for pt, name in zip([tl, tr, (W-1, H-1), (0, H-1)],
-                            ["TL", "TR", "BR", "BL"]):
-            cv2.circle(dbg, pt, 10, (0, 0, 255), -1)
-            cv2.putText(dbg, name, (pt[0] + 10, pt[1] - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-        cv2.imwrite(args.debug, dbg)
-        print("debug image written to", args.debug)
-
-    corners = det._corners_from_mask(filtered, sample.shape)
-    if len(corners) != 4:
-        raise SystemExit("corner detection failed (got %d corners)" % len(corners))
-
-    four = [corners[0], corners[1], corners[2], corners[3]]
-    hr = homography_from_4_corners(four)
-
-    kps = {}
-    H_inv = hr.H_real_to_img
-    for kid, (xm, ym) in ref.KEYPOINTS_M.items():
-        v = np.array([xm, ym, 1.0]); p = H_inv @ v
-        kps[kid] = (float(p[0] / p[2]), float(p[1] / p[2]))
-
-    calib = Calibration.from_homography_result(
-        hr, image_size=(sample.shape[1], sample.shape[0]),
-        keypoints_img=kps, source="blue-trap",
-    )
-    save(calib, args.out)
-    print("wrote", args.out)
-    if args.vis:
-        _draw_verification(sample, calib, args.vis)
-        print("wrote", args.vis)
-
 
 def _enclosing_trapezoid(mask, pad_frac=0.03, pad_const=10):
     """Fit a tight trapezoid around the non-zero region in mask, then expand outward.
@@ -329,9 +181,18 @@ def _enclosing_trapezoid(mask, pad_frac=0.03, pad_const=10):
     return tl, tr, br, bl
 
 
-def cmd_blue_tcd(args):
-    """Hybrid: blue-contour mask → fit enclosing trapezoid → expand → TCD."""
-    from tennisvision.court.tcd_model import HeatmapDetector  # noqa
+
+def cmd_blue_resnet(args):
+    """ResNet50 regression court keypoint detector with perspective warp.
+
+    1. Build blue mask → fit enclosing trapezoid → perspective-warp to rectangle.
+    2. Run ResNet50 on N sampled frames in warp space, median-aggregate 14 keypoints.
+    3. Inverse-warp keypoints back to original image coordinates.
+    4. Estimate homography and save calib.
+
+    Pass --no-warp to skip perspective rectification (broadcast/elevated footage).
+    """
+    from tennisvision.court.tcd_model import ResNet50CourtDetector
     from tennisvision.court.homography import estimate_homography
 
     det_blue = BlueContourDetector()
@@ -339,45 +200,41 @@ def cmd_blue_tcd(args):
     if sample is None:
         raise SystemExit("could not read any frames from " + args.video)
 
-    H, W = sample.shape[:2]
+    H_img, W_img = sample.shape[:2]
+    det = ResNet50CourtDetector(weights=args.weights, device=args.device)
 
-    if mask is not None:
-        quad = _enclosing_trapezoid(mask, pad_frac=args.pad_frac,
-                                    pad_const=args.pad_const)
-        if quad is not None:
-            tl, tr, _br, _bl = quad
-            # Bottom corners: extend to frame edges so near-baseline players
-            # don't occlude the court region from TCD's view.
-            bl = (0, H - 1)
-            br = (W - 1, H - 1)
-            pts = np.array([tl, tr, br, bl], dtype=np.int32)
-            trap_mask = np.zeros((H, W), dtype=np.uint8)
-            cv2.fillPoly(trap_mask, [pts], 255)
-            masked_frame = cv2.bitwise_and(sample, sample, mask=trap_mask)
-            if args.debug:
-                dbg = sample.copy()
-                cv2.polylines(dbg, [pts], True, (0, 255, 0), 3)
-                for pt, name in zip([tl, tr, br, bl], ["TL", "TR", "BR", "BL"]):
-                    cv2.circle(dbg, pt, 10, (0, 0, 255), -1)
-                    cv2.putText(dbg, name, (pt[0] + 10, pt[1] - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                cv2.imwrite(args.debug, dbg)
-                cv2.imwrite(args.debug.replace(".jpg", "_masked.jpg"), masked_frame)
-                print("debug images written:", args.debug,
-                      "and", args.debug.replace(".jpg", "_masked.jpg"))
-        else:
-            print("WARNING: trapezoid fit failed; using raw blue mask")
-            masked_frame = cv2.bitwise_and(sample, sample, mask=mask)
-    else:
-        print("WARNING: blue-contour mask failed; running TCD on unmasked frame")
-        masked_frame = sample
+    M = M_inv = None
+    out_w, out_h = args.warp_size
 
-    det_tcd = HeatmapDetector(weights=args.weights, device=args.device,
-                              low_thresh=args.tcd_thresh)
+    if not args.no_warp:
+        if mask is None:
+            raise SystemExit("blue-contour mask failed; cannot build warp")
+        quad = _enclosing_trapezoid(mask, pad_frac=0.0, pad_const=0)
+        if quad is None:
+            raise SystemExit("could not fit enclosing trapezoid from blue mask")
+        tl, tr, _br, _bl = quad
+        bl = (0, H_img - 1)
+        br = (W_img - 1, H_img - 1)
+        src = np.float32([tl, tr, br, bl])
+        dst = np.float32([[0, 0], [out_w - 1, 0],
+                          [out_w - 1, out_h - 1], [0, out_h - 1]])
+        M = cv2.getPerspectiveTransform(src, dst)
+        M_inv = np.linalg.inv(M)
 
-    # Multi-frame aggregation: sample N frames across the video, apply the same
-    # trapezoid mask to each, run TCD, and median-aggregate positions per keypoint.
-    # Players move between frames so different court keypoints become visible.
+        if args.debug:
+            warped_sample = cv2.warpPerspective(sample, M, (out_w, out_h))
+            cv2.imwrite(args.debug, warped_sample)
+            trap_vis = sample.copy()
+            pts_vis = np.array([tl, tr, br, bl], dtype=np.int32)
+            cv2.polylines(trap_vis, [pts_vis], True, (0, 255, 0), 3)
+            for pt, name in zip([tl, tr, br, bl], ["TL", "TR", "BR", "BL"]):
+                cv2.circle(trap_vis, pt, 10, (0, 0, 255), -1)
+                cv2.putText(trap_vis, name, (pt[0] + 10, pt[1] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            cv2.imwrite(args.debug.replace(".jpg", "_trap.jpg"), trap_vis)
+            print("debug images written:", args.debug,
+                  "and", args.debug.replace(".jpg", "_trap.jpg"))
+
     cap = cv2.VideoCapture(args.video)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_idxs = np.linspace(5, max(total - 5, 6), args.frames).astype(int)
@@ -388,28 +245,33 @@ def cmd_blue_tcd(args):
         ok, f = cap.read()
         if not ok:
             continue
-        mf = cv2.bitwise_and(f, f, mask=trap_mask if mask is not None else np.full(
-            (H, W), 255, np.uint8))
-        for kid, (x, y) in det_tcd.detect(mf).items():
+        if M is not None:
+            f = cv2.warpPerspective(f, M, (out_w, out_h))
+        for kid, (x, y) in det.detect(f).items():
             all_dets.setdefault(kid, []).append((x, y))
     cap.release()
 
-    kps = {kid: (float(np.median([p[0] for p in pts])),
-                 float(np.median([p[1] for p in pts])))
-           for kid, pts in all_dets.items()}
-    print("TCD aggregated %d keypoints over %d frames: %s" %
-          (len(kps), len(frame_idxs), sorted(kps.keys())))
+    # Median in detection space
+    kps_med: dict = {}
+    for kid, pts in all_dets.items():
+        xm = float(np.median([p[0] for p in pts]))
+        ym = float(np.median([p[1] for p in pts]))
+        if M_inv is not None:
+            pt_back = cv2.perspectiveTransform(
+                np.array([[[xm, ym]]], dtype=np.float32), M_inv)[0][0]
+            xm, ym = float(pt_back[0]), float(pt_back[1])
+        kps_med[kid] = (xm, ym)
 
-    if len(kps) < 4:
-        raise SystemExit("only %d keypoints detected; need >=4" % len(kps))
+    print("ResNet50 detected %d keypoints over %d frames: %s" %
+          (len(kps_med), len(frame_idxs), sorted(kps_med.keys())))
 
-    hr = estimate_homography(kps, min_conf_count=4)
+    hr = estimate_homography(kps_med, min_conf_count=4)
     if hr is None:
         raise SystemExit("could not fit homography from detected keypoints")
 
     calib = Calibration.from_homography_result(
         hr, image_size=(sample.shape[1], sample.shape[0]),
-        keypoints_img=kps, source="blue-tcd",
+        keypoints_img=kps_med, source="blue-resnet",
     )
     save(calib, args.out)
     print("wrote %s  (used subset %s, reprojection err %.2f m)" %
@@ -463,45 +325,19 @@ def main():
     b.add_argument("--vis",   default="calib_vis.jpg")
     b.set_defaults(func=cmd_blue)
 
-    bw = sub.add_parser("blue-warp", help="perspective-warp court to rectangle, run TCD, unproject back")
-    bw.add_argument("--video",      required=True)
-    bw.add_argument("--weights",    default="weights/court_tcd.pt")
-    bw.add_argument("--device",     default="cpu")
-    bw.add_argument("--warp-size",  type=int, nargs=2, default=[640, 360],
-                    dest="warp_size", metavar=("W", "H"),
-                    help="output rectangle size for TCD (default 640 360)")
-    bw.add_argument("--frames",     type=int, default=20)
-    bw.add_argument("--tcd-thresh", type=int, default=150, dest="tcd_thresh")
-    bw.add_argument("--out",        default="calib.json")
-    bw.add_argument("--vis",        default="calib_vis.jpg")
-    bw.add_argument("--debug",      default=None)
-    bw.set_defaults(func=cmd_blue_warp)
-
-    btr = sub.add_parser("blue-trap", help="blue-contour + enclosing-trapezoid pre-filter (no TCD needed)")
-    btr.add_argument("--video",      required=True)
-    btr.add_argument("--pad-frac",   type=float, default=0.03, dest="pad_frac")
-    btr.add_argument("--pad-const",  type=int,   default=10,   dest="pad_const")
-    btr.add_argument("--out",        default="calib.json")
-    btr.add_argument("--vis",        default="calib_vis.jpg")
-    btr.add_argument("--debug",      default=None)
-    btr.set_defaults(func=cmd_blue_trap)
-
-    bt = sub.add_parser("blue-tcd", help="hybrid: blue-contour mask + TCD CNN (handles partial courts)")
-    bt.add_argument("--video",      required=True)
-    bt.add_argument("--weights",    default="weights/court_tcd.pt")
-    bt.add_argument("--device",     default="cpu")
-    bt.add_argument("--pad-frac",   type=float, default=0.03,
-                    dest="pad_frac",  help="expand trapezoid by trap_height*frac (default 0.03)")
-    bt.add_argument("--pad-const",  type=int, default=10,
-                    dest="pad_const", help="additional constant pixel expansion (default 10)")
-    bt.add_argument("--frames",     type=int, default=20,
-                    help="number of video frames to aggregate TCD over (default 20)")
-    bt.add_argument("--tcd-thresh", type=int, default=170,
-                    dest="tcd_thresh", help="TCD heatmap threshold 0-255 (default 170, lower=more detections)")
-    bt.add_argument("--out",        default="calib.json")
-    bt.add_argument("--vis",        default="calib_vis.jpg")
-    bt.add_argument("--debug",      default=None, help="save trapezoid debug image to this path")
-    bt.set_defaults(func=cmd_blue_tcd)
+    br = sub.add_parser("blue-resnet", help="ResNet50 regression court keypoint detector")
+    br.add_argument("--video",      required=True)
+    br.add_argument("--weights",    default="weights/court_resnet.pth")
+    br.add_argument("--device",     default="cpu")
+    br.add_argument("--frames",     type=int, default=20)
+    br.add_argument("--no-warp",    action="store_true", dest="no_warp",
+                    help="skip perspective warp; run ResNet50 on original frames directly")
+    br.add_argument("--warp-size",  type=int, nargs=2, default=[640, 360],
+                    dest="warp_size", metavar=("W", "H"))
+    br.add_argument("--out",        default="calib.json")
+    br.add_argument("--vis",        default="calib_vis.jpg")
+    br.add_argument("--debug",      default=None)
+    br.set_defaults(func=cmd_blue_resnet)
 
     t = sub.add_parser("tcd", help="TennisCourtDetector CNN (V1 — requires weights)")
     t.add_argument("--video",   required=True)

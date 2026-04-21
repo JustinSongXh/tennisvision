@@ -42,7 +42,7 @@
 
 | 模块 | 可选实现 | 默认 | 权重文件 |
 |---|---|---|---|
-| **球场标定** (`scripts/calibrate.py`) | `mark` — 手画红线图 / `blue` — 蓝色轮廓 / `tcd` — TennisCourtDetector CNN | `mark` | `tcd` 需 `weights/court_tcd.pt`；`mark`/`blue` 无 |
+| **球场标定** (`scripts/calibrate.py`) | `blue-resnet` — 蓝色区域透视变换 + ResNet50 回归（推荐）/ `mark` — 手画红线图 / `tcd` — TennisCourtDetector CNN（广播视角）/ `blue` — 蓝色轮廓（无 ML 备选） | `blue-resnet` | `blue-resnet` 需 `weights/court_resnet.pth`；`tcd` 需 `weights/court_tcd.pt`；`mark`/`blue` 无 |
 | **球检测** (`ball.detector`) | `classical` — HSV + MOG2 / `wasb` — WASB HRNet | **`wasb`** | `wasb_tennis_best.pth.tar`（首次运行自动导出为 `.onnx`） |
 | **球轨迹** | 多目标 Kalman + champion 选择 | 唯一 | 无 |
 | **落点检测** (`bounce.detector`) | `peak` — y 方向极值 baseline / `catboost` — 轨迹特征分类器 | **`catboost`** | `bounce_catboost.cbm` |
@@ -69,7 +69,8 @@ tennisvision/
 │   └── remote_inpaint_debug.yaml    # 同上，debug 模式
 │
 ├── weights/                         # 模型权重（gitignored）
-│   ├── court_tcd.pt                 # TennisCourtDetector（标定可选）
+│   ├── court_resnet.pth             # ResNet50 球场 14 点回归（标定推荐，~95 MB）
+│   ├── court_tcd.pt                 # TennisCourtDetector heatmap CNN（广播视角备选）
 │   ├── wasb_tennis_best.pth.tar     # WASB HRNet 球检测（首次运行自动导出 .onnx）
 │   ├── InpaintNet_best.pt           # TrackNetV3 InpaintNet 轨迹补洞（可选）
 │   ├── bounce_catboost.cbm          # CatBoost 落点分类器
@@ -155,12 +156,12 @@ tennisvision/
       def detect(self, frame: np.ndarray) -> list[Keypoint]: ...
   ```
 - **实现**：
-  | 实现 | 算法 | 权重 | 精度 | CPU 推理 |
-  |---|---|---|---|---|
-  | `HeatmapDetector` | yastrebksv TennisCourtDetector（15 通道 heatmap，640×360） | Drive `1f-Co64...` | 中值误差 1.83 px | ~200 ms |
-  | `ResNet50Regressor` | CourtCheck 风格：ResNet50 + Linear(28) 坐标回归 | 自训 or abdullahtarek 权重 | 较低 | ~100 ms |
-  | `RedMarkExtractor` | 从用户手工红色标注图提取（HSV 红 + Hough） | 无 | 取决标注 | <50 ms |
-- **默认**：`HeatmapDetector`；`RedMarkExtractor` 作为离线手动 fallback。
+  | 实现 | 算法 | 权重 | 适用场景 |
+  |---|---|---|---|
+  | `ResNet50CourtDetector` | abdullahtarek 风格：ResNet50 + Linear(28) 坐标回归，始终输出全 14 点 | `court_resnet.pth` | 业余蓝色硬地（推荐） |
+  | `HeatmapDetector` | yastrebksv TennisCourtDetector（15 通道 heatmap，640×360） | `court_tcd.pt` | 广播 / 高位摄像 |
+  | `RedMarkExtractor` | 从用户手工红色标注图提取（HSV 红 + Hough） | 无 | 手动 fallback |
+- **blue-resnet pipeline**：`BlueContourDetector` 构建蓝色区域 mask → `_enclosing_trapezoid` 拟合外接梯形 → `cv2.warpPerspective` 矫正为正视图 → `ResNet50CourtDetector` 多帧回归 + median 聚合 → 逆透视投影回原图坐标。
 
 #### `homography.py` — H 估计（核心改进点）
 - **职责**：从 14 个（可能部分缺失的）关键点估计单应矩阵 H（图像平面 → 球场平面）。
@@ -422,17 +423,42 @@ pip install -r requirements.txt
 ```
 
 ### 球场标定
-```bash
-python scripts/calibrate.py \
-    --video input.mp4 \
-    --out   calib.json \
-    --method tcd             # tcd | resnet | mark
-```
-- `--method tcd`：调用 `court.detector.HeatmapDetector`（默认）
-- `--method resnet`：`ResNet50Regressor`
-- `--method mark --marked-image court_mark.jpg`：从手工红色标注图提取
 
-会输出 `calib.json` 和 `calib_vis.jpg`（叠加投影回检查）。
+```bash
+# 推荐：自动标定（业余 / 蓝色硬地球场）
+python scripts/calibrate.py blue-resnet \
+    --video  input.mp4 \
+    --weights weights/court_resnet.pth \
+    --out    calib.json \
+    --vis    calib_vis.jpg
+
+# 手动标注图备选
+python scripts/calibrate.py mark \
+    --image  court_mark.jpg \
+    --out    calib.json
+
+# 广播视角（TCD heatmap CNN）
+python scripts/calibrate.py tcd \
+    --video  input.mp4 \
+    --weights weights/court_tcd.pt \
+    --out    calib.json
+
+# 无 ML 依赖备选（蓝色轮廓，精度较低）
+python scripts/calibrate.py blue \
+    --video  input.mp4 \
+    --out    calib.json
+```
+
+所有方法均输出 `calib.json` + `calib_vis.jpg`（court overlay 供人工核验）。
+
+| 方法 | 适用场景 | 权重 | Reprojection err（样例） |
+|---|---|---|---|
+| `blue-resnet` | 业余蓝色硬地，低位摄像 | `court_resnet.pth`（~95 MB） | ~0.8 m |
+| `mark` | 任意场地，需手动画框 | 无 | 取决于标注精度 |
+| `tcd` | 广播 / 高位摄像 | `court_tcd.pt` | ~1–2 m（低位失效）|
+| `blue` | 蓝色硬地，无 ML 环境 | 无 | ~2–4 m |
+
+`blue-resnet` 权重下载：`gdown 1QrTOF1ToQ4plsSZbkBs3zOLkVt3MBlta -O weights/court_resnet.pth`
 
 ### 完整分析
 ```bash
