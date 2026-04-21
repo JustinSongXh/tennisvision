@@ -179,46 +179,43 @@ class _PlayerState:
 
 
 class MultiPlayerStrokeRecognizer:
-    """Runs per-player pose + classification.
+    """Runs per-player pose + classification via a single YOLOPoseTracker.
 
-    The player count is whatever YOLOv8 reports on each frame, filtered
-    through `PlayerDetector` (bbox-size and conf thresholds).  Singles →
-    typically 2 tracks; doubles → 4; warm-up rallies with a coach in
-    frame → 3 — all handled the same way.
+    `pose_tracker.push_frame()` returns {track_id: (bbox, Pose)} in one
+    model call — no separate player detector needed.  Singles → typically
+    2 tracks; doubles → 4; warm-up with a coach → 3; all handled the same.
 
     Track state is garbage-collected when a track disappears for longer
-    than `track_ttl_frames` frames.  That prevents a momentary miss (e.g.
-    occlusion by the net) from resetting a player's sliding window.
+    than `track_ttl_frames` frames so momentary occlusions don't reset
+    the sliding window.
     """
 
     def __init__(
         self,
         cfg: StrokeClassifierConfig,
-        pose_extractor,
-        player_detector,
+        pose_tracker,
         track_ttl_frames: int = 30,
     ):
         self.cfg = cfg
-        self.pose = pose_extractor
-        self.player_det = player_detector
+        self.pose_tracker = pose_tracker
         self.track_ttl_frames = track_ttl_frames
         self._model = _load_keras_model(cfg.weights)
         self._states: dict = {}      # track_id -> _PlayerState
         self._last_seen: dict = {}   # track_id -> frame_idx
         # Exposed so the pipeline can render per-frame bboxes without
-        # re-running the detector.  Populated on every push_frame() call.
+        # re-running the tracker.  Populated on every push_frame() call.
         self.last_detections: dict = {}
 
     def reset(self) -> None:
         self._states.clear()
         self._last_seen.clear()
         self.last_detections = {}
-        self.player_det.reset()
+        self.pose_tracker.reset()
 
     def push_frame(self, frame: np.ndarray, frame_idx: int) -> list:
-        H, W = frame.shape[:2]
-        detections = self.player_det.detect(frame, frame_idx)  # {tid: (x0,y0,x1,y1)}
-        self.last_detections = detections
+        # {tid: (bbox, Pose)} — single model call covers detection+pose.
+        tracked = self.pose_tracker.push_frame(frame, frame_idx)
+        self.last_detections = {tid: bbox for tid, (bbox, _) in tracked.items()}
 
         # GC tracks that have been absent for a while.
         for tid in list(self._states.keys()):
@@ -227,14 +224,13 @@ class MultiPlayerStrokeRecognizer:
                 self._last_seen.pop(tid, None)
 
         events: list = []
-        for tid, bbox in detections.items():
+        for tid, (bbox, pose) in tracked.items():
             self._last_seen[tid] = frame_idx
             st = self._states.get(tid)
             if st is None:
                 st = _PlayerState(window=deque(maxlen=self.cfg.window_frames))
                 self._states[tid] = st
 
-            pose = self.pose.extract(frame, frame_idx, roi=bbox)
             bx0, by0, bx1, by1 = bbox
             feat = _pose_to_feature(
                 pose, norm_h=(by1 - by0), norm_w=(bx1 - bx0),

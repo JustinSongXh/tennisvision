@@ -80,17 +80,13 @@ def _build_stroke_recognizer(acfg, calib=None):
     """
     if not acfg or not acfg.get("enabled"):
         return None
-    from ..action.pose import MoveNetConfig, MoveNetPoseExtractor
+    from ..action.pose import YOLOPoseTrackerConfig, YOLOPoseTracker
     from ..action.stroke_classifier import (
         MultiPlayerStrokeRecognizer,
         StrokeClassifier,
         StrokeClassifierConfig,
     )
 
-    pose = MoveNetPoseExtractor(MoveNetConfig(
-        weights=acfg["movenet_tflite"],
-        score_threshold=acfg.get("score_threshold", 0.2),
-    ))
     cls_cfg = StrokeClassifierConfig(
         weights=acfg["rnn_weights"],
         window_frames=acfg["window_frames"],
@@ -101,27 +97,25 @@ def _build_stroke_recognizer(acfg, calib=None):
     )
 
     pcfg = acfg.get("player", {})
-    if pcfg.get("enabled", True):
-        from ..action.player import PlayerDetector, PlayerDetectorConfig
-        det = PlayerDetector(
-            PlayerDetectorConfig(
-                weights=pcfg["weights"],
-                device=pcfg.get("device", "cpu"),
-                conf=pcfg.get("conf", 0.4),
-                iou=pcfg.get("iou", 0.5),
-                tracker=pcfg.get("tracker", "bytetrack.yaml"),
-                imgsz=pcfg.get("imgsz", 640),
-                min_bbox_h=pcfg.get("min_bbox_h", 60),
-                max_persons=pcfg.get("max_persons", 4),
-                court_margin_m=pcfg.get("court_margin_m", 3.0),
-            ),
-            calib=calib,
-        )
-        return MultiPlayerStrokeRecognizer(
-            cls_cfg, pose, det,
-            track_ttl_frames=pcfg.get("track_ttl_frames", 30),
-        )
-    return StrokeClassifier(cls_cfg, pose)
+    tracker = YOLOPoseTracker(
+        YOLOPoseTrackerConfig(
+            weights=acfg["pose_weights"],
+            device=acfg.get("pose_device", "cpu"),
+            conf=pcfg.get("conf", 0.3),
+            iou=pcfg.get("iou", 0.5),
+            tracker=pcfg.get("tracker", "bytetrack.yaml"),
+            imgsz=pcfg.get("imgsz", 640),
+            score_threshold=acfg.get("score_threshold", 0.2),
+            min_bbox_h=pcfg.get("min_bbox_h", 60),
+            max_persons=pcfg.get("max_persons", 4),
+            court_margin_m=pcfg.get("court_margin_m", 3.0),
+        ),
+        calib=calib,
+    )
+    return MultiPlayerStrokeRecognizer(
+        cls_cfg, tracker,
+        track_ttl_frames=pcfg.get("track_ttl_frames", 30),
+    )
 
 
 def _build_ball_detector(bcfg):

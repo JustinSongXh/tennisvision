@@ -16,15 +16,14 @@ render:
   minimap_width_px: 90           # down from 150 so it stops covering the far court
 action:
   enabled: true
-  movenet_tflite: /root/personal/movenet_lightning_f16.tflite
-  rnn_weights:   /root/personal/tennis_rnn.h5
-  min_confidence: 0.9            # back up — 0.5 produces too many spurious labels to trust
-  emit_neutral:   false           # suppress idle / reset poses; labels only on actual strokes
+  pose_weights: /root/personal/yolo26n-pose.pt
+  pose_device:  cuda            # cpu | cuda
+  rnn_weights:  /root/personal/tennis_rnn.h5
+  min_confidence: 0.9
+  emit_neutral:   false
   stride:         5
   player:
-    enabled:       true
-    weights:       /root/personal/yolov8n.pt
-    conf:          0.25           # down from 0.4 to catch far/small players
-    min_bbox_h:    30             # down from 60 — far players ≈ 50-70 px tall
-    max_persons:   6              # up from 4 so coach+4 players doesn't crowd far players out
-    court_margin_m: 5.0           # up from 3 — looser on-court filter for calib slop
+    conf:          0.25
+    min_bbox_h:    30
+    max_persons:   6
+    court_margin_m: 5.0

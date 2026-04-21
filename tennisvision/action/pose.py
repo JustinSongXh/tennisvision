@@ -1,35 +1,28 @@
-"""MoveNet SinglePose Lightning wrapper (TFLite fp16).
+"""YOLO26-pose tracker: player detection, tracking, and pose in one model call.
 
-Weights: download once with
-    wget -O weights/movenet_lightning_f16.tflite \
-        'https://tfhub.dev/google/lite-model/movenet/singlepose/lightning/tflite/float16/4?lite-format=tflite'
+Replaces the old MoveNet (pose) + YOLOv8n (detection) pair.  A single
+`yolo26n-pose.pt` forward pass produces bounding boxes, ByteTrack IDs, and
+17 COCO keypoints for every player simultaneously.
 
-Preprocessing matches `tf.image.resize_with_pad` (aspect-preserving
-letterbox centered on a black canvas, uint8).  Outputs are 17 COCO
-keypoints with confidence, back-projected to original-frame pixels.
+`YOLOPoseTracker.push_frame()` is called once per frame and returns
+`{track_id: (bbox, Pose)}`.  The pipeline no longer needs a separate
+`PlayerDetector`.
+
+Output `Pose.keypoints` is (17, 3) float32 in **(y, x, score)** order,
+matching the convention expected by `_pose_to_feature` in stroke_classifier.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Tuple
 
-import cv2
 import numpy as np
 
-# TFLite interpreter — prefer the lightweight `tflite_runtime` package;
-# fall back to the one bundled with full `tensorflow`.
-_Interpreter = None
-try:
-    from tflite_runtime.interpreter import Interpreter as _Interpreter  # type: ignore
-except ImportError:
-    try:
-        from tensorflow.lite.python.interpreter import Interpreter as _Interpreter  # type: ignore
-    except ImportError:
-        pass
+from ..court import reference as _ref
+from ..court.homography import project_image_to_court as _proj
 
 
-# COCO-17 keypoint order that MoveNet outputs.
 KEYPOINT_NAMES = (
     "nose",
     "left_eye", "right_eye", "left_ear", "right_ear",
@@ -43,13 +36,6 @@ KEYPOINT_NAMES = (
 
 
 @dataclass
-class MoveNetConfig:
-    weights: str = "weights/movenet_lightning_f16.tflite"
-    input_size: int = 192
-    score_threshold: float = 0.2      # per-keypoint score below this → treated as missing
-
-
-@dataclass
 class Pose:
     """One frame's pose: (17, 3) array of (y_px, x_px, score) in ORIGINAL image coords."""
     keypoints: np.ndarray   # shape (17, 3), dtype float32
@@ -59,78 +45,123 @@ class Pose:
         return self.keypoints[:, 2] >= thr
 
 
-def _letterbox(frame: np.ndarray, size: int) -> Tuple[np.ndarray, float, int, int]:
-    """Resize preserving aspect ratio, pad with zeros, centered.
+@dataclass
+class YOLOPoseTrackerConfig:
+    weights: str = "weights/yolo26n-pose.pt"
+    device: str = "cpu"           # "cpu" | "cuda" | "cuda:0"
+    conf: float = 0.3
+    iou: float = 0.5
+    imgsz: int = 640
+    tracker: str = "bytetrack.yaml"
+    score_threshold: float = 0.2  # per-keypoint visibility threshold (downstream)
+    min_bbox_h: int = 60          # px — drop tiny / far detections
+    max_persons: int = 4          # cap: 2 singles, 4 doubles
+    court_margin_m: float = 3.0   # on-court filter tolerance in metres
 
-    Returns (padded uint8 HxWx3, scale, pad_top, pad_left).
+
+# Convenience alias so pipeline code can import either name.
+YOLOPoseConfig = YOLOPoseTrackerConfig
+
+
+class YOLOPoseTracker:
+    """Single-model player tracker + pose extractor.
+
+    Call `push_frame(frame, frame_idx)` each frame to get
+    `{track_id: (bbox, Pose)}` where bbox is (x0, y0, x1, y1) in pixels.
+
+    On-court filtering is applied when a `Calibration` is supplied at
+    construction; otherwise every detected person is kept.
     """
-    H, W = frame.shape[:2]
-    scale = size / max(H, W)
-    nh, nw = int(round(H * scale)), int(round(W * scale))
-    resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
-    top = (size - nh) // 2
-    left = (size - nw) // 2
-    padded = np.zeros((size, size, 3), dtype=np.uint8)
-    padded[top:top + nh, left:left + nw] = resized
-    return padded, float(scale), top, left
 
-
-class MoveNetPoseExtractor:
-    """Stateless per-frame MoveNet wrapper.
-
-    Call `extract(frame, roi=None)` to get a Pose.  `roi` (optional) is
-    an (x0, y0, x1, y1) pixel box — when present, MoveNet runs on that
-    crop and keypoints are back-projected into the full frame.  This is
-    the hook for per-player tracking in multi-player scenes; leaving
-    it None means "run on whole frame" (good only for single-player
-    clips until a separate player detector is wired in).
-    """
-
-    def __init__(self, cfg: MoveNetConfig):
-        if _Interpreter is None:
+    def __init__(self, cfg: YOLOPoseTrackerConfig, calib=None):
+        try:
+            from ultralytics import YOLO  # type: ignore
+        except ImportError as e:
             raise RuntimeError(
-                "MoveNet needs TFLite runtime: `pip install tflite-runtime` "
-                "(or `tensorflow`).")
+                "YOLOPoseTracker needs ultralytics: `pip install ultralytics`"
+            ) from e
         self.cfg = cfg
-        self._interp = _Interpreter(model_path=cfg.weights)
-        self._interp.allocate_tensors()
-        self._in = self._interp.get_input_details()[0]
-        self._out = self._interp.get_output_details()[0]
+        self.calib = calib
+        self._model = YOLO(cfg.weights)
 
-    def extract(
-        self,
-        frame: np.ndarray,
-        frame_idx: int,
-        roi: Optional[Tuple[int, int, int, int]] = None,
-    ) -> Pose:
-        if roi is not None:
-            x0, y0, x1, y1 = roi
-            x0 = max(0, x0); y0 = max(0, y0)
-            x1 = min(frame.shape[1], x1); y1 = min(frame.shape[0], y1)
-            crop = frame[y0:y1, x0:x1]
-            origin_x, origin_y = x0, y0
-            crop_h, crop_w = (y1 - y0), (x1 - x0)
-        else:
-            crop = frame
-            origin_x = origin_y = 0
-            crop_h, crop_w = frame.shape[:2]
-        if crop_h <= 0 or crop_w <= 0:
-            return Pose(keypoints=np.zeros((17, 3), dtype=np.float32),
-                        frame_idx=frame_idx)
+    def reset(self) -> None:
+        try:
+            self._model.predictor = None  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
-        padded, scale, pad_top, pad_left = _letterbox(crop, self.cfg.input_size)
-        # MoveNet expects RGB uint8
-        rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
-        self._interp.set_tensor(self._in["index"], rgb[None, ...])
-        self._interp.invoke()
-        # Output shape: (1, 1, 17, 3) — (y, x, score) all normalized to [0,1]
-        out = self._interp.get_tensor(self._out["index"])[0, 0]
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-        # Un-letterbox: out coords are fractions of input_size.
-        in_s = float(self.cfg.input_size)
-        ys_in = out[:, 0] * in_s
-        xs_in = out[:, 1] * in_s
-        ys_crop = (ys_in - pad_top) / scale
-        xs_crop = (xs_in - pad_left) / scale
-        kp = np.stack([ys_crop + origin_y, xs_crop + origin_x, out[:, 2]], axis=1)
-        return Pose(keypoints=kp.astype(np.float32), frame_idx=frame_idx)
+    def _on_court(self, bbox: Tuple[float, float, float, float]) -> bool:
+        if self.calib is None:
+            return True
+        x0, _, x1, y1 = bbox
+        foot_x, foot_y = 0.5 * (x0 + x1), y1
+        try:
+            rx, ry = _proj(self.calib.H_img_to_real, (foot_x, foot_y))
+        except Exception:
+            return True
+        m = self.cfg.court_margin_m
+        return (
+            -m <= rx <= _ref.COURT_WIDTH_M + m
+            and -m <= ry <= _ref.COURT_LENGTH_M + m
+        )
+
+    @staticmethod
+    def _kp_to_pose(kp_xy: np.ndarray, frame_idx: int) -> Pose:
+        """Convert YOLO keypoints (17, 3) in (x, y, conf) → Pose in (y, x, score)."""
+        kp_yx = np.stack(
+            [kp_xy[:, 1], kp_xy[:, 0], kp_xy[:, 2]], axis=1
+        ).astype(np.float32)
+        return Pose(keypoints=kp_yx, frame_idx=frame_idx)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def push_frame(
+        self, frame: np.ndarray, frame_idx: int
+    ) -> Dict[int, Tuple[Tuple[int, int, int, int], Pose]]:
+        """Run detection + tracking + pose on one frame.
+
+        Returns {track_id: (bbox, Pose)} filtered by height, court bounds,
+        and max_persons.  Empty dict when no players are detected.
+        """
+        results = self._model.track(
+            frame,
+            persist=True,
+            verbose=False,
+            classes=[0],
+            conf=self.cfg.conf,
+            iou=self.cfg.iou,
+            tracker=self.cfg.tracker,
+            device=self.cfg.device,
+            imgsz=self.cfg.imgsz,
+        )
+        r = results[0]
+
+        if (r.boxes is None or r.boxes.id is None
+                or r.keypoints is None or len(r.keypoints.data) == 0):
+            return {}
+
+        boxes = r.boxes.xyxy.cpu().numpy()          # (N, 4)
+        ids   = r.boxes.id.cpu().numpy().astype(int)  # (N,)
+        confs = r.boxes.conf.cpu().numpy()           # (N,)
+        kps   = r.keypoints.data.cpu().numpy()       # (N, 17, 3): x, y, conf
+
+        out: Dict[int, Tuple[Tuple[int, int, int, int], Pose]] = {}
+        for idx in np.argsort(-confs):               # high-confidence first
+            if len(out) >= self.cfg.max_persons:
+                break
+            x0, y0, x1, y1 = boxes[idx]
+            if (y1 - y0) < self.cfg.min_bbox_h:
+                continue
+            bbox = (int(x0), int(y0), int(x1), int(y1))
+            if not self._on_court(bbox):
+                continue
+            pose = self._kp_to_pose(kps[idx], frame_idx)
+            out[int(ids[idx])] = (bbox, pose)
+
+        return out

@@ -78,7 +78,8 @@ DEFAULTS: dict = {
     },
     "action": {
         "enabled": False,
-        "movenet_tflite": "weights/movenet_lightning_f16.tflite",
+        "pose_weights": "weights/yolo26n-pose.pt",
+        "pose_device": "cpu",        # "cpu" | "cuda" | "cuda:0"
         "rnn_weights": "weights/tennis_rnn.h5",
         "window_frames": 30,
         "labels": ["backhand", "forehand", "neutral", "serve"],
@@ -86,13 +87,9 @@ DEFAULTS: dict = {
         "stride": 5,
         "emit_neutral": False,
         "score_threshold": 0.2,
-        # Per-player detection. enabled=false falls back to full-frame
-        # single-player (only useful for debugging / single-player clips).
+        # Player filtering params (detection weights are now pose_weights above).
         "player": {
-            "enabled": True,
-            "weights": "weights/yolov8n.pt",
-            "device": "cpu",
-            "conf": 0.4,
+            "conf": 0.3,
             "iou": 0.5,
             "tracker": "bytetrack.yaml",
             "imgsz": 640,

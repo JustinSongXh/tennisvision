@@ -14,8 +14,7 @@ inpainter:
   th_h_frac: 0.05            # out-of-view threshold as fraction of frame height
 action:
   enabled: true
-  movenet_tflite: /root/personal/movenet_lightning_f16.tflite
-  rnn_weights:   /root/personal/tennis_rnn.h5
-  player:
-    enabled: true
-    weights:     /root/personal/yolov8n.pt
+  pose_weights: /root/personal/yolo26n-pose.pt
+  pose_device:  cuda            # cpu | cuda
+  rnn_weights:  /root/personal/tennis_rnn.h5
+  player: {}
