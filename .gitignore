@@ -1,6 +1,5 @@
-# Model weights (large, downloaded per-machine)
-weights/*
-!weights/.gitkeep
+# Model weights
+# (tracked in repo)
 
 # Sample media (also large)
 *.mp4
