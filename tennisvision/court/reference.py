@@ -80,6 +80,14 @@ COURT_CONF: list[tuple[int, int, int, int]] = [
     # near baseline + near service line
     (3, 2, 9, 8),
     (7, 6, 9, 8),
+    # both service Ts + near corner pairs — useful when TCD only sees the
+    # near side of the court (ground-level / amateur footage)
+    (2, 6, 12, 13),   # near-right doubles+singles + both service Ts
+    (3, 7, 12, 13),   # near-left doubles+singles  + both service Ts
+    (2, 3, 12, 13),   # near doubles corners        + both service Ts
+    (6, 7, 12, 13),   # near singles corners        + both service Ts
+    (2, 9, 12, 13),   # NR + NRv + both Ts
+    (3, 8, 12, 13),   # NL + NLv + both Ts
 ]
 
 

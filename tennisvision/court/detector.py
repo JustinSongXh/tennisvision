@@ -39,21 +39,23 @@ class CourtDetector(Protocol):
 # ---------------------------------------------------------------------------
 
 class BlueContourDetector:
-    """For videos where the entire blue doubles court is inside the frame
-    and clearly bounded by green surround.  Unions per-frame largest blue
-    connected-components across many frames (to heal player occlusions),
-    then fits a 4-vertex polygon to the blob.
+    """For videos where the target blue court is inside the frame,
+    potentially alongside adjacent courts of the same colour.
 
-    Only returns the 4 doubles corners (keypoint ids 0..3 in FL/FR/NR/NL
-    order).  Fails (returns {}) if the blob isn't contiguous or can't be
-    approximated by a quadrilateral.
+    Per-frame, a **vertical** closing kernel bridges the horizontal net gap
+    (near-half ↔ far-half) without merging left/right neighbouring courts.
+    The contour nearest the image centre is kept each frame; unioning those
+    per-frame masks isolates the target court before fitting a quad.
     """
 
     BLUE_LOW  = (95, 60, 60)
     BLUE_HIGH = (125, 255, 230)
-    SAMPLE_FRAMES = 40       # how many frames to union (per-call API)
-    CLOSE_KERNEL  = 31       # bridge near+far halves across the net gap
-    CENTER_BIAS   = True     # prefer CC closest to image center over just largest
+    SAMPLE_FRAMES = 40
+    # Vertical kernel: tall enough to bridge the net gap, width=1 so it
+    # doesn't reach into neighbouring courts on the left or right.
+    NET_CLOSE_H   = 100   # height of vertical closing kernel — must exceed net gap (~70px)
+    NET_CLOSE_W   = 5     # narrow width — won't bridge horizontal boundaries
+    MIN_AREA_FRAC = 0.04  # contour must cover ≥ this fraction of frame area
 
     def __init__(self, blue_low=None, blue_high=None):
         if blue_low is not None:
@@ -61,15 +63,25 @@ class BlueContourDetector:
         if blue_high is not None:
             self.BLUE_HIGH = tuple(blue_high)
 
-    # Single-frame API (satisfies the CourtDetector Protocol but is
-    # inferior to `calibrate_from_video` for occluded scenes).
     def detect(self, frame: np.ndarray) -> dict:
-        mask = self._single_frame_mask(frame)
-        return self._corners_from_mask(mask)
+        mask = self._single_frame_mask(frame, keep_contour=True)
+        return self._corners_from_mask(mask, frame.shape)
 
-    # Preferred API: run on a video path, unioning many frames.
     def calibrate_from_video(self, video_path: str):
-        import cv2
+        sample, accum = self._mask_from_video(video_path)
+        if accum is None:
+            return sample, {}
+        return sample, self._corners_from_mask(accum, sample.shape)
+
+    def court_mask_from_video(self, video_path: str):
+        """Return (sample_frame, accumulated_court_mask) for the target court.
+
+        The mask can be applied to a frame before feeding to TCD so that
+        adjacent courts are blacked out.  Returns (None, None) on failure.
+        """
+        return self._mask_from_video(video_path)
+
+    def _mask_from_video(self, video_path: str):
         cap = cv2.VideoCapture(video_path)
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         idxs = np.linspace(10, max(total - 10, 11), self.SAMPLE_FRAMES).astype(int)
@@ -86,47 +98,68 @@ class BlueContourDetector:
             accum = m if accum is None else cv2.bitwise_or(accum, m)
         cap.release()
         if accum is None:
-            return sample, {}
+            return sample, None
+        # Small square close to fill residual holes after union.
         accum = cv2.morphologyEx(accum, cv2.MORPH_CLOSE,
-                                 np.ones((self.CLOSE_KERNEL,) * 2, np.uint8))
-        return sample, self._corners_from_mask(accum)
+                                 np.ones((9, 9), np.uint8))
+        return sample, accum
 
     def _single_frame_mask(self, frame: np.ndarray, keep_contour=False) -> np.ndarray:
-        import cv2
         H, W = frame.shape[:2]
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         m = cv2.inRange(hsv, np.array(self.BLUE_LOW, np.uint8),
                               np.array(self.BLUE_HIGH, np.uint8))
-        if keep_contour:
-            # Close the net-sized gap first so near+far halves fuse
-            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE,
-                                 np.ones((self.CLOSE_KERNEL,) * 2, np.uint8))
-            contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                return m
-            if self.CENTER_BIAS:
-                cx, cy = W / 2.0, H / 2.0
-                def score(c):
-                    M = cv2.moments(c)
-                    if M["m00"] < 1e-6:
-                        return 1e9
-                    x, y = M["m10"] / M["m00"], M["m01"] / M["m00"]
-                    # penalize distance from image center, reward area
-                    return ((x - cx) ** 2 + (y - cy) ** 2) / (cv2.contourArea(c) + 1.0)
-                chosen = min(contours, key=score)
-            else:
-                chosen = max(contours, key=cv2.contourArea)
-            out = np.zeros_like(m)
-            cv2.drawContours(out, [chosen], -1, 255, -1)
-            return out
-        return m
+        if not keep_contour:
+            return m
 
-    def _corners_from_mask(self, mask) -> dict:
-        import cv2
+        # Vertical kernel bridges the net gap (horizontal strip) without
+        # reaching into left/right neighbouring courts.
+        k_net = np.ones((self.NET_CLOSE_H, self.NET_CLOSE_W), np.uint8)
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k_net)
+
+        contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return np.zeros_like(m)
+
+        min_area = H * W * self.MIN_AREA_FRAC
+        contours = [c for c in contours if cv2.contourArea(c) >= min_area]
+        if not contours:
+            return np.zeros_like(m)
+
+        # Pick contour whose centroid is closest to image centre, weighted
+        # by area so tiny near-centre blobs don't win over the real court.
+        cx, cy = W / 2.0, H / 2.0
+        def score(c):
+            M = cv2.moments(c)
+            if M["m00"] < 1e-6:
+                return 1e9
+            x, y = M["m10"] / M["m00"], M["m01"] / M["m00"]
+            return ((x - cx) ** 2 + (y - cy) ** 2) / (cv2.contourArea(c) + 1.0)
+
+        chosen = min(contours, key=score)
+        out = np.zeros_like(m)
+        cv2.drawContours(out, [chosen], -1, 255, -1)
+        return out
+
+    def _corners_from_mask(self, mask, frame_shape=None) -> dict:
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         if not contours:
             return {}
-        cnt = max(contours, key=cv2.contourArea)
+
+        # Among remaining contours prefer the one nearest image centre.
+        if frame_shape is not None:
+            H, W = frame_shape[:2]
+            cx, cy = W / 2.0, H / 2.0
+            def score(c):
+                M = cv2.moments(c)
+                if M["m00"] < 1e-6:
+                    return 1e9
+                x, y = M["m10"] / M["m00"], M["m01"] / M["m00"]
+                return ((x - cx) ** 2 + (y - cy) ** 2) / (cv2.contourArea(c) + 1.0)
+            cnt = min(contours, key=score)
+        else:
+            cnt = max(contours, key=cv2.contourArea)
+
         hull = cv2.convexHull(cnt)
         peri = cv2.arcLength(hull, True)
         quad = None
