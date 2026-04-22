@@ -70,6 +70,7 @@ class YOLOPoseTrackerConfig:
     far_crop_margin_px: int = 40  # extra pixels around far-court corners
     far_merge_contained: float = 0.6  # above this fraction of overlap with a main bbox, drop far detection
     far_conf: float = 0.15        # lower conf for far-crop pass (net mesh cuts score)
+    far_imgsz: int = 1600         # higher imgsz for the crop pass — at 1280 the 4th player was conf=0.1, at 1600 conf>0.5
 
 
 # Convenience alias so pipeline code can import either name.
@@ -196,7 +197,7 @@ class YOLOPoseTracker:
         far_area = max(1, (ax1 - ax0) * (ay1 - ay0))
         return float(inter) / far_area
 
-    def _run(self, model, img, conf):
+    def _run(self, model, img, conf, imgsz):
         """Run one tracker call and return (boxes, ids, confs, kps) arrays."""
         results = model.track(
             img,
@@ -207,7 +208,7 @@ class YOLOPoseTracker:
             iou=self.cfg.iou,
             tracker=self.cfg.tracker,
             device=self.cfg.device,
-            imgsz=self.cfg.imgsz,
+            imgsz=imgsz,
         )
         r = results[0]
         if (r.boxes is None or r.boxes.id is None
@@ -232,7 +233,7 @@ class YOLOPoseTracker:
         if (x1c - x0c) < 40 or (y1c - y0c) < 40:
             return {}
         crop = frame[y0c:y1c, x0c:x1c]
-        packed = self._run(self._model_far, crop, self.cfg.far_conf)
+        packed = self._run(self._model_far, crop, self.cfg.far_conf, self.cfg.far_imgsz)
         if packed is None:
             return {}
         boxes, ids, confs, kps = packed
@@ -265,7 +266,7 @@ class YOLOPoseTracker:
         Returns {track_id: (bbox, Pose)} filtered by height, court bounds,
         and max_persons.  Empty dict when no players are detected.
         """
-        packed = self._run(self._model_main, frame, self.cfg.conf)
+        packed = self._run(self._model_main, frame, self.cfg.conf, self.cfg.imgsz)
         out: Dict[int, Tuple[Tuple[int, int, int, int], Pose]] = {}
         if packed is not None:
             boxes, ids, confs, kps = packed
