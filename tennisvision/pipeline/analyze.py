@@ -354,9 +354,23 @@ def run(
     tail_len = tcfg["render_tail"]
     frame_idx = 0
 
+    # Online gating: skip the expensive pose + stroke pass during obvious
+    # non-rally stretches.  Ball detection still runs every frame so a
+    # resuming rally is caught within one frame; once recovered we call
+    # stroke_rec.reset() to flush any stale pose window from the old rally.
+    _rcfg = cfg.get("rally") or {}
+    online_gating = bool(_rcfg.get("online_gating", False)) and stroke_rec is not None
+    silence_thresh = max(1, int(_rcfg.get("online_silence_frames", 90)))
+    gate_in_rally = False
+    silent_frames = 0
+    if online_gating:
+        print("[rally] online gating enabled (silence_thresh=%d frames)" %
+              silence_thresh, flush=True)
+
     print("[pass 1] tracking %d frames ..." % total, flush=True)
     t0 = time.time()
     t_last = t0
+    gated_skips = 0
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -375,13 +389,31 @@ def run(
             if tid not in after_ids and t.validated:
                 retired_tracks[tid] = t
 
-        if stroke_rec is not None:
+        # ------ online rally gating state machine ------
+        if online_gating:
+            has_activity = bool(cand_xys) or (champion is not None and champion.validated)
+            if not gate_in_rally:
+                if has_activity:
+                    gate_in_rally = True
+                    silent_frames = 0
+                    stroke_rec.reset()     # flush stale pose window / tracks
+            else:
+                if has_activity:
+                    silent_frames = 0
+                else:
+                    silent_frames += 1
+                    if silent_frames >= silence_thresh:
+                        gate_in_rally = False
+
+        if stroke_rec is not None and (not online_gating or gate_in_rally):
             ball_xy: Optional[tuple] = None
             if champion is not None and champion.pts:
                 last_pt = champion.pts[-1]
                 ball_xy = (last_pt.x, last_pt.y)
             stroke_events.extend(stroke_rec.push_frame(frame, frame_idx,
                                                         ball_xy=ball_xy))
+        elif online_gating and not gate_in_rally:
+            gated_skips += 1
 
         fs = _FrameState(n_cands=len(cand_xys), n_tracks=len(tracker.tracks))
         if champion is not None:
@@ -407,6 +439,10 @@ def run(
     print("[pass 1] done in %.1fs  (%d validated tracks)" %
           (time.time() - t0, sum(1 for t in retired_tracks.values() if t.validated)),
           flush=True)
+    if online_gating:
+        pct = 100.0 * gated_skips / max(frame_idx, 1)
+        print("[rally] online gating: %d / %d frames skipped pose+stroke (%.0f%%)"
+              % (gated_skips, frame_idx, pct), flush=True)
 
     if stroke_rec is not None:
         by_label: dict = {}

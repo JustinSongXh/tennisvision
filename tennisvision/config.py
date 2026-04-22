@@ -127,6 +127,15 @@ DEFAULTS: dict = {
         # `.mp4` with `_rally.mp4` / `_rallies.json`.
         "clip_path": None,
         "json_path": None,
+        # Pass-1 optimization: use a simple state machine to skip the pose
+        # tracker + stroke classifier during obvious non-rally stretches
+        # (no ball detected for N frames).  Ball detection still runs every
+        # frame so the system can recover quickly when a rally resumes.
+        # Stroke events during the first ~window_frames of a new rally may
+        # be missed because the pose buffer needs time to fill — trade-off
+        # accepted.  Default OFF to preserve current behavior.
+        "online_gating": False,
+        "online_silence_frames": 90,   # ~3s at 30 fps
     },
 }
 
