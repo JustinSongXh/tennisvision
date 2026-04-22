@@ -32,6 +32,10 @@ class Rally:
     start_frame: int
     end_frame: int
     n_events: int
+    # Populated by validate_rallies(); useful for downstream selection
+    # (e.g. a stricter net-crossing threshold for the clip video).
+    net_crossings: int = 0
+    n_strokes: int = 0
 
 
 def detect_rallies(
@@ -140,13 +144,51 @@ def validate_rallies(
         # count is a safety net for legit rallies where tracking was
         # patchy but the RNN still fired.
         if net_ok or strokes_ok:
-            kept.append(Rally(idx=len(kept),
-                              start_frame=r.start_frame,
-                              end_frame=r.end_frame,
-                              n_events=r.n_events))
+            kept.append(Rally(
+                idx=len(kept),
+                start_frame=r.start_frame,
+                end_frame=r.end_frame,
+                n_events=r.n_events,
+                net_crossings=n_cross,
+                n_strokes=n_strokes,
+            ))
         else:
             dropped += 1
     return kept
+
+
+def select_clip_rallies(
+    rallies: list[Rally],
+    fps: float,
+    *,
+    min_net_crossings: int = 0,
+    min_duration_seconds: float = 0.0,
+) -> list[Rally]:
+    """Tighter subset of rallies for the highlight cut.
+
+    Uses the `net_crossings` field that `validate_rallies` cached on
+    each Rally, so this runs in O(n) without re-walking ball tracks.
+    Filters cascade as AND: a rally must pass every enabled threshold.
+    Both at 0 (default) returns the input list unchanged.
+    """
+    if min_net_crossings <= 0 and min_duration_seconds <= 0:
+        return list(rallies)
+    min_dur_frames = int(round(max(0.0, min_duration_seconds) * max(fps, 1.0)))
+    out: list[Rally] = []
+    for r in rallies:
+        if min_net_crossings > 0 and r.net_crossings < min_net_crossings:
+            continue
+        if min_dur_frames > 0 and (r.end_frame - r.start_frame + 1) < min_dur_frames:
+            continue
+        out.append(Rally(
+            idx=len(out),
+            start_frame=r.start_frame,
+            end_frame=r.end_frame,
+            n_events=r.n_events,
+            net_crossings=r.net_crossings,
+            n_strokes=r.n_strokes,
+        ))
+    return out
 
 
 def write_rally_video(

@@ -636,15 +636,31 @@ def run(
     # the rendered output into a highlight-only companion file.
     # ------------------------------------------------------------------
     if rally_enabled:
-        from .rally import write_rally_video, save_rally_json
+        from .rally import write_rally_video, save_rally_json, select_clip_rallies
 
         stem, ext = os.path.splitext(output_path)
         clip_path = rcfg_rally.get("clip_path") or (stem + "_rally" + (ext or ".mp4"))
         json_path = rcfg_rally.get("json_path") or (stem + "_rallies.json")
-        if rallies:
+
+        # Full list stays in the json.  The cut video gets a stricter
+        # subset — short rallies and ball-pickup blips are dropped.
+        clip_rallies = select_clip_rallies(
+            rallies, fps,
+            min_net_crossings=int(rcfg_rally.get("clip_min_net_crossings", 3)),
+            min_duration_seconds=float(rcfg_rally.get("clip_min_duration_seconds", 2.0)),
+        )
+        if len(clip_rallies) != len(rallies):
+            print("[rally] clip filter: %d -> %d rallies "
+                  "(clip_min_net_crossings=%d, clip_min_duration_seconds=%.1f)"
+                  % (len(rallies), len(clip_rallies),
+                     int(rcfg_rally.get("clip_min_net_crossings", 3)),
+                     float(rcfg_rally.get("clip_min_duration_seconds", 2.0))),
+                  flush=True)
+
+        if clip_rallies:
             t_cut = time.time()
             write_rally_video(
-                output_path, rallies, clip_path,
+                output_path, clip_rallies, clip_path,
                 separator_seconds=float(rcfg_rally.get("separator_seconds", 1.0)),
             )
             print("[rally] wrote %s (%.1fs)" %

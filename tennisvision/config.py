@@ -147,6 +147,11 @@ DEFAULTS: dict = {
         # Set both to 0 to disable filtering (old behavior).
         "min_net_crossings": 1,
         "min_stroke_events": 0,
+        # Stricter filter applied ONLY to the cut highlight video (and
+        # the _rallies.json stays the full list).  Cascades as AND.
+        # Tune up to trim short scrappy rallies and ball-pickup clips.
+        "clip_min_net_crossings": 3,
+        "clip_min_duration_seconds": 2.0,
     },
 }
 
