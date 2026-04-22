@@ -456,6 +456,40 @@ def run(
           (len(events), len(bounces_court)), flush=True)
 
     # ------------------------------------------------------------------
+    # RALLY DETECTION (before Pass 2 so the renderer can clear HUD /
+    # minimap at rally boundaries instead of accumulating across the
+    # whole video).
+    # ------------------------------------------------------------------
+    rcfg_rally = cfg.get("rally") or {}
+    rally_enabled = bool(rcfg_rally.get("enabled", True))
+    rallies: list = []
+    frame_to_rally: list = []     # frame_idx -> rally index, or -1
+    if rally_enabled:
+        from .rally import detect_rallies
+
+        event_frames: list = []
+        for t in all_tracks:
+            event_frames.extend(p.frame for p in t.pts)
+        event_frames.extend(f for (_, _, f) in bounces_court)
+        event_frames.extend(ev.frame for ev in stroke_events)
+
+        rallies = detect_rallies(
+            event_frames,
+            fps=fps,
+            gap_seconds=float(rcfg_rally.get("gap_seconds", 3.0)),
+            min_events=int(rcfg_rally.get("min_events", 3)),
+            pre_roll_frames=int(rcfg_rally.get("pre_roll_frames", 30)),
+            post_roll_frames=int(rcfg_rally.get("post_roll_frames", 30)),
+            total_frames=total,
+        )
+        print("[rally] detected %d rallies" % len(rallies), flush=True)
+
+        frame_to_rally = [-1] * (total + 2)
+        for r in rallies:
+            for f in range(r.start_frame, min(r.end_frame, total) + 1):
+                frame_to_rally[f] = r.idx
+
+    # ------------------------------------------------------------------
     # PASS 2 — render
     # ------------------------------------------------------------------
     cap = cv2.VideoCapture(video_path)
@@ -483,6 +517,17 @@ def run(
         fs = frame_states.get(frame_idx, _FrameState())
 
         vis = frame.copy()
+
+        # Current rally (or -1 if this frame sits in a gap).  Used below
+        # to reset HUD text and minimap bounces at rally boundaries.
+        ridx = frame_to_rally[frame_idx] if frame_to_rally else -1
+        r_cur = rallies[ridx] if ridx >= 0 else None
+        if r_cur is not None:
+            rally_bounces = [(x, y, f) for (x, y, f) in bounces_court
+                             if r_cur.start_frame <= f <= frame_idx]
+        else:
+            rally_bounces = []
+
         if fs.champion_id is not None and fs.champion_trail:
             pts_obj = [TrackPoint(x, y, f) for (x, y, f) in fs.champion_trail]
             draw_trail(vis, pts_obj, frame_idx,
@@ -491,14 +536,25 @@ def run(
             draw_players(vis, fs.player_bboxes)
             draw_stroke_labels(vis, fs.player_bboxes, events_by_player,
                                frame_idx, ttl_frames=stroke_label_ttl)
-        minimap.overlay(vis, bounces_court, frame_idx)
-        n_shown = sum(1 for _, _, f in bounces_court if f <= frame_idx)
 
-        champ_info = "-" if fs.champion_id is None \
-            else "#%d len=%d" % (fs.champion_id, len(fs.champion_trail))
-        hud = "f=%d/%d cands=%d tracks=%d champ=%s bounces=%d/%d" % (
-            frame_idx, total, fs.n_cands, fs.n_tracks, champ_info,
-            n_shown, len(bounces_court))
+        if rally_enabled and r_cur is None:
+            # Between rallies: no minimap, no per-rally counters.
+            hud = "f=%d/%d  (between rallies)  rallies=%d" % (
+                frame_idx, total, len(rallies))
+        else:
+            minimap.overlay(vis, rally_bounces, frame_idx)
+            champ_info = "-" if fs.champion_id is None \
+                else "#%d len=%d" % (fs.champion_id, len(fs.champion_trail))
+            if r_cur is not None:
+                hud = "rally %d  f=%d/%d  cands=%d tracks=%d champ=%s bounces=%d" % (
+                    r_cur.idx + 1, frame_idx, total,
+                    fs.n_cands, fs.n_tracks, champ_info, len(rally_bounces))
+            else:
+                # rally disabled → fall back to original cumulative HUD
+                n_shown = sum(1 for _, _, f in bounces_court if f <= frame_idx)
+                hud = "f=%d/%d cands=%d tracks=%d champ=%s bounces=%d/%d" % (
+                    frame_idx, total, fs.n_cands, fs.n_tracks, champ_info,
+                    n_shown, len(bounces_court))
         draw_hud(vis, hud)
 
         out.write(vis)
@@ -513,6 +569,27 @@ def run(
     cap.release()
     out.release()
     print("[pass 2] done in %.1fs" % (time.time() - t0), flush=True)
+
+    # ------------------------------------------------------------------
+    # RALLY CUT VIDEO — detection already done before Pass 2, now cut
+    # the rendered output into a highlight-only companion file.
+    # ------------------------------------------------------------------
+    if rally_enabled:
+        from .rally import write_rally_video, save_rally_json
+
+        stem, ext = os.path.splitext(output_path)
+        clip_path = rcfg_rally.get("clip_path") or (stem + "_rally" + (ext or ".mp4"))
+        json_path = rcfg_rally.get("json_path") or (stem + "_rallies.json")
+        if rallies:
+            t_cut = time.time()
+            write_rally_video(
+                output_path, rallies, clip_path,
+                separator_seconds=float(rcfg_rally.get("separator_seconds", 1.0)),
+            )
+            print("[rally] wrote %s (%.1fs)" %
+                  (clip_path, time.time() - t_cut), flush=True)
+        save_rally_json(rallies, json_path, fps=fps)
+        print("[rally] wrote %s" % json_path, flush=True)
 
     return AnalyzeResult(
         total_frames=frame_idx,

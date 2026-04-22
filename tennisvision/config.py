@@ -112,6 +112,22 @@ DEFAULTS: dict = {
     "debug": {
         "dir": None,
     },
+    "rally": {
+        # Group ball-activity events (tracks, bounces, strokes) into rallies
+        # and emit a cut video containing only the rally segments.  The
+        # cut video re-uses the annotated Pass-2 output — no extra model
+        # passes required.
+        "enabled": True,
+        "gap_seconds": 3.0,        # events more than this apart start a new rally
+        "min_events": 3,           # drop short groups (stray detections)
+        "pre_roll_frames": 30,     # ~1s before first event at 30fps
+        "post_roll_frames": 30,    # ~1s after last event
+        "separator_seconds": 1.0,  # black "Rally N" title between clips
+        # Output paths: None → derive from analyze --out by replacing
+        # `.mp4` with `_rally.mp4` / `_rallies.json`.
+        "clip_path": None,
+        "json_path": None,
+    },
 }
 
 
