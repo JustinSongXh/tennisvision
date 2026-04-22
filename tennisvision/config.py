@@ -140,6 +140,14 @@ DEFAULTS: dict = {
         # Both thresholds at 0 → include every detected rally in the cut.
         "clip_min_net_crossings": 3,
         "clip_min_duration_seconds": 2.0,
+        # Parallel Pass-1b: kick off a pose worker thread as soon as a
+        # rally is confirmed in Pass 1a, so ball detection (main thread,
+        # WASB on CoreML/CPU) overlaps with pose + RNN inference.
+        # Requires enough CPU cores to avoid contention (8+ recommended).
+        # When enabled, pose_torch_threads caps the worker's torch pool
+        # so the main thread keeps its fair share of cores.
+        "parallel_pose": False,
+        "pose_torch_threads": 4,
     },
 }
 

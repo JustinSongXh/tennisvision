@@ -17,6 +17,9 @@ in with zero changes to the render code.
 from __future__ import annotations
 
 import os
+import threading
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -277,6 +280,45 @@ def _run_bounce_detector(tracks: list, cfg: dict) -> list:
     return out
 
 
+def _run_pose_for_rally(rally, video_path: str, stroke_rec, frame_states: dict):
+    """Pose + stroke for one rally.
+
+    Used by both the sequential Pass-1b loop and (when parallel_pose is
+    enabled) the ThreadPoolExecutor worker.  Returns
+    (events, bboxes_by_frame, frames_done, wall_time_s) so the caller
+    can merge results and print a per-rally summary.
+
+    The caller is responsible for ensuring only one invocation runs at a
+    time against the same stroke_rec — with max_workers=1 the executor
+    already guarantees this, so no explicit lock is needed.
+    """
+    stroke_rec.reset()
+    cap = cv2.VideoCapture(video_path)
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, rally.start_frame - 1))
+        events: list = []
+        bboxes_by_frame: dict = {}
+        t0 = time.time()
+        done = 0
+        for fi in range(rally.start_frame, rally.end_frame + 1):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            fs = frame_states.get(fi)
+            ball_xy: Optional[tuple] = None
+            if fs is not None and fs.champion_trail:
+                last_x, last_y, last_f = fs.champion_trail[-1]
+                if fi - last_f <= 5:
+                    ball_xy = (last_x, last_y)
+            events.extend(stroke_rec.push_frame(frame, fi, ball_xy=ball_xy))
+            bboxes_by_frame[fi] = dict(
+                getattr(stroke_rec, "last_detections", {}))
+            done += 1
+    finally:
+        cap.release()
+    return events, bboxes_by_frame, done, time.time() - t0
+
+
 def _project_bounces(events: list, calib: Calibration) -> list:
     """Project image-space BounceEvents to court-meter space; filter to
     plausible on-court bounces.  Returns (x_m, y_m, frame) tuples."""
@@ -298,7 +340,6 @@ def run(
     *,
     progress_every: int = 100,
 ) -> AnalyzeResult:
-    import time
     ball_det, ball_detect_fn = _build_ball_detector(cfg["ball"], calib=calib)
     tcfg = cfg["tracker"]
     tracker = MultiTrackManager(TrackerConfig(
@@ -361,6 +402,24 @@ def run(
     # ------------------------------------------------------------------
     _rcfg = cfg.get("rally") or {}
     rally_enabled = bool(_rcfg.get("enabled", True))
+    parallel_pose = bool(_rcfg.get("parallel_pose", False)) and stroke_rec is not None
+    pose_executor: Optional[ThreadPoolExecutor] = None
+    pose_futures: list = []         # list[(rally, Future)]
+    n_submitted_rallies = 0
+    if parallel_pose:
+        # Constrain torch's thread pool so the WASB main thread keeps
+        # cores of its own.  Safe to call before any heavy torch op; once
+        # set, ultralytics and the YOLO predictor pick it up.
+        try:
+            import torch as _torch
+            _torch.set_num_threads(max(1, int(_rcfg.get("pose_torch_threads", 4))))
+        except Exception:
+            pass
+        pose_executor = ThreadPoolExecutor(max_workers=1,
+                                            thread_name_prefix="pose")
+        print("[rally] parallel pose enabled (pose_torch_threads=%d)"
+              % int(_rcfg.get("pose_torch_threads", 4)), flush=True)
+
     net_center = np.array([ref.COURT_WIDTH_M / 2.0, ref.NET_Y, 1.0])
     p_net = calib.H_real_to_img @ net_center
     net_y_px = float(p_net[1] / p_net[2])
@@ -412,6 +471,21 @@ def run(
 
         if online_det is not None:
             online_det.observe(frame_idx, cand_xys, champion)
+            # Kick off pose worker for any newly-confirmed rally.  We
+            # don't wait for post_roll to elapse here because _close()
+            # already clipped rally.end to current_frame - silence + post_roll,
+            # and silence_thresh >= post_roll in the default config so
+            # frame_states[rally.end] is already populated by Pass-1a.
+            if parallel_pose and len(online_det.rallies) > n_submitted_rallies:
+                for r in online_det.rallies[n_submitted_rallies:]:
+                    pose_futures.append((r, pose_executor.submit(
+                        _run_pose_for_rally, r, video_path,
+                        stroke_rec, frame_states)))
+                    print("  [pose worker] queued rally %d [%d..%d] (%d f)"
+                          % (r.idx + 1, r.start_frame, r.end_frame,
+                             r.end_frame - r.start_frame + 1),
+                          flush=True)
+                n_submitted_rallies = len(online_det.rallies)
 
         fs = _FrameState(n_cands=len(cand_xys), n_tracks=len(tracker.tracks))
         if champion is not None:
@@ -445,6 +519,17 @@ def run(
            sum(1 for t in retired_tracks.values() if t.validated),
            len(rallies)),
           flush=True)
+
+    # finalize() may have closed a still-open activity → submit any
+    # trailing rallies to the pose worker before we wait.
+    if parallel_pose and len(rallies) > n_submitted_rallies:
+        for r in rallies[n_submitted_rallies:]:
+            pose_futures.append((r, pose_executor.submit(
+                _run_pose_for_rally, r, video_path, stroke_rec, frame_states)))
+            print("  [pose worker] queued rally %d [%d..%d] (%d f)"
+                  % (r.idx + 1, r.start_frame, r.end_frame,
+                     r.end_frame - r.start_frame + 1), flush=True)
+        n_submitted_rallies = len(rallies)
 
     # Also include tracks still alive after the last frame
     for t in tracker.tracks:
@@ -486,45 +571,56 @@ def run(
     # ball-proximity gate still works per-frame.
     # ------------------------------------------------------------------
     if stroke_rec is not None and rallies:
-        print("[pass 1b] pose + stroke for %d rallies ..." % len(rallies),
-              flush=True)
-        cap = cv2.VideoCapture(video_path)
         t_pass1b = time.time()
         total_rally_frames = 0
-        for r in rallies:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, r.start_frame - 1))
-            stroke_rec.reset()
-            n_frames = r.end_frame - r.start_frame + 1
-            rt0 = time.time()
-            for fi in range(r.start_frame, r.end_frame + 1):
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                fs = frame_states.get(fi)
-                ball_xy: Optional[tuple] = None
-                if fs is not None and fs.champion_trail:
-                    last_x, last_y, last_f = fs.champion_trail[-1]
-                    if fi - last_f <= 5:
-                        ball_xy = (last_x, last_y)
-                stroke_events.extend(
-                    stroke_rec.push_frame(frame, fi, ball_xy=ball_xy))
-                if fs is not None:
-                    fs.player_bboxes = dict(
-                        getattr(stroke_rec, "last_detections", {}))
-            r_time = max(time.time() - rt0, 1e-6)
-            total_rally_frames += n_frames
-            print("  [pass 1b] rally %d/%d  frames [%d..%d] (%d f)  "
-                  "%.1fs = %.1f fps  crossings=%d  strokes_so_far=%d"
-                  % (r.idx + 1, len(rallies), r.start_frame, r.end_frame,
-                     n_frames, r_time, n_frames / r_time,
-                     r.net_crossings, len(stroke_events)),
+
+        if parallel_pose:
+            # Pose workers have been running alongside Pass-1a; now
+            # drain the queue in submission order and merge results.
+            print("[pass 1b] waiting for %d parallel pose workers ..."
+                  % len(pose_futures), flush=True)
+            pose_executor.shutdown(wait=True)
+            for idx, (r, fut) in enumerate(pose_futures):
+                evs, bboxes, n_done, r_time = fut.result()
+                stroke_events.extend(evs)
+                for fi, bb in bboxes.items():
+                    fs = frame_states.get(fi)
+                    if fs is not None:
+                        fs.player_bboxes = bb
+                total_rally_frames += n_done
+                print("  [pass 1b] rally %d/%d  frames [%d..%d] (%d f)  "
+                      "%.1fs = %.1f fps  crossings=%d  strokes_so_far=%d"
+                      % (r.idx + 1, len(rallies), r.start_frame, r.end_frame,
+                         n_done, r_time, n_done / max(r_time, 1e-6),
+                         r.net_crossings, len(stroke_events)),
+                      flush=True)
+        else:
+            print("[pass 1b] pose + stroke for %d rallies ..." % len(rallies),
                   flush=True)
-        cap.release()
+            for r in rallies:
+                evs, bboxes, n_done, r_time = _run_pose_for_rally(
+                    r, video_path, stroke_rec, frame_states)
+                stroke_events.extend(evs)
+                for fi, bb in bboxes.items():
+                    fs = frame_states.get(fi)
+                    if fs is not None:
+                        fs.player_bboxes = bb
+                total_rally_frames += n_done
+                print("  [pass 1b] rally %d/%d  frames [%d..%d] (%d f)  "
+                      "%.1fs = %.1f fps  crossings=%d  strokes_so_far=%d"
+                      % (r.idx + 1, len(rallies), r.start_frame, r.end_frame,
+                         n_done, r_time, n_done / max(r_time, 1e-6),
+                         r.net_crossings, len(stroke_events)),
+                      flush=True)
+
         dt = time.time() - t_pass1b
         print("[pass 1b] done in %.1fs  (%d frames, %.1f fps, %d strokes)"
               % (dt, total_rally_frames,
                  total_rally_frames / max(dt, 1e-6),
                  len(stroke_events)), flush=True)
+    elif parallel_pose and pose_executor is not None:
+        # No rallies detected — still need to clean up the idle executor.
+        pose_executor.shutdown(wait=True)
 
         # Summary by label / player.
         by_label: dict = {}
