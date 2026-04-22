@@ -95,6 +95,7 @@ def _build_stroke_recognizer(acfg, calib=None):
         stride=acfg.get("stride", 5),
         emit_neutral=acfg.get("emit_neutral", False),
         ball_proximity_px=float(acfg.get("ball_proximity_px", 300)),
+        ball_proximity_window_frames=int(acfg.get("ball_proximity_window_frames", 15)),
     )
 
     pcfg = acfg.get("player", {})

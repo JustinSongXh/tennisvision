@@ -49,8 +49,12 @@ class StrokeClassifierConfig:
     stride: int = 5                    # run inference at most every `stride` frames per track
     emit_neutral: bool = False         # if False, suppress neutral-class events
     normalize_by_frame_size: bool = True  # divide (y, x) by (H, W) before buffering
-    ball_proximity_px: float = 300.0   # skip RNN inference when ball is farther than this
-                                       # (feature window still accumulates); 0 = disabled
+    ball_proximity_px: float = 300.0   # skip RNN inference when ball has not been within
+                                       # this distance of the player in `ball_proximity_window_frames`
+                                       # recent frames; 0 = disabled
+    ball_proximity_window_frames: int = 15  # how many recent frames to consult for ball position;
+                                            # tolerates ball-detector gaps (motion blur at impact)
+                                            # while still filtering empty swings (no ball in flight)
 
 
 @dataclass
@@ -207,11 +211,17 @@ class MultiPlayerStrokeRecognizer:
         # Exposed so the pipeline can render per-frame bboxes without
         # re-running the tracker.  Populated on every push_frame() call.
         self.last_detections: dict = {}
+        # Ball position history — used to gate RNN inference so that an
+        # "empty swing" (no ball in flight anywhere) doesn't get classified
+        # as a stroke.  Each entry is the ball_xy passed that frame, or
+        # None when the ball detector missed.
+        self._ball_history: deque = deque(maxlen=max(1, cfg.ball_proximity_window_frames))
 
     def reset(self) -> None:
         self._states.clear()
         self._last_seen.clear()
         self.last_detections = {}
+        self._ball_history.clear()
         self.pose_tracker.reset()
 
     def push_frame(self, frame: np.ndarray, frame_idx: int,
@@ -219,6 +229,7 @@ class MultiPlayerStrokeRecognizer:
         # {tid: (bbox, Pose)} — single model call covers detection+pose.
         tracked = self.pose_tracker.push_frame(frame, frame_idx)
         self.last_detections = {tid: bbox for tid, (bbox, _) in tracked.items()}
+        self._ball_history.append(ball_xy)
 
         # GC tracks that have been absent for a while.
         for tid in list(self._states.keys()):
@@ -247,13 +258,22 @@ class MultiPlayerStrokeRecognizer:
             if frame_idx - st.last_infer_frame < self.cfg.stride:
                 continue
 
-            # Skip RNN when ball is far from this player — accumulate the
-            # window so history is ready when the player does make contact.
-            if ball_xy is not None and self.cfg.ball_proximity_px > 0:
+            # Ball-presence gate: skip RNN when the ball has NOT been within
+            # ball_proximity_px of this player in any of the last N frames.
+            # This filters empty swings (no ball in flight) without being
+            # fooled by the ball detector dropping a frame or two at impact.
+            if self.cfg.ball_proximity_px > 0:
                 cx_ = 0.5 * (bbox[0] + bbox[2])
                 cy_ = 0.5 * (bbox[1] + bbox[3])
-                dist = ((cx_ - ball_xy[0]) ** 2 + (cy_ - ball_xy[1]) ** 2) ** 0.5
-                if dist > self.cfg.ball_proximity_px:
+                thr2 = self.cfg.ball_proximity_px ** 2
+                seen_close = False
+                for b in self._ball_history:
+                    if b is None:
+                        continue
+                    if (cx_ - b[0]) ** 2 + (cy_ - b[1]) ** 2 <= thr2:
+                        seen_close = True
+                        break
+                if not seen_close:
                     continue
 
             st.last_infer_frame = frame_idx
