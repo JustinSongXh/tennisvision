@@ -3,6 +3,7 @@
 # Weights staged at /root/personal/, not repo weights/.
 ball:
   weights: weights/wasb_tennis_best.pth.tar
+  two_stage: false           # skip far-crop WASB pass; one ONNX call per frame
 bounce:
   weights: weights/bounce_catboost.cbm
 inpainter:
@@ -20,5 +21,6 @@ action:
   player: {}
 rally:
   online_min_net_crossings: 3    # confirm rally on ≥3 net transitions in one burst
+  pre_roll_seconds: 3.0          # 3s lead-in guards against missed serve/toss frames
   clip_min_net_crossings: 3      # cut video keeps all such rallies
   clip_min_duration_seconds: 2.0 # and at least 2s long

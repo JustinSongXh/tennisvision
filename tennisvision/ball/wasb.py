@@ -172,9 +172,15 @@ def _export_onnx(pt_weights: str, onnx_path: str,
 
 def _build_ort_session(onnx_path: str):
     available = ort.get_available_providers()
-    providers = []
+    providers: list = []
     if "OpenVINOExecutionProvider" in available:
         providers.append(("OpenVINOExecutionProvider", {"device_type": "CPU_FP32"}))
+    if "CoreMLExecutionProvider" in available:
+        # MLProgram backend is faster than the default NeuralNetwork on
+        # recent macOS; falls back gracefully for ops it doesn't support.
+        providers.append(("CoreMLExecutionProvider", {
+            "ModelFormat": "MLProgram",
+        }))
     providers.append("CPUExecutionProvider")
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL

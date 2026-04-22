@@ -1,0 +1,25 @@
+# Local-run config, mirroring remote_inpaint.yaml but pointing at the
+# in-repo weights directory so paths resolve when cwd is the repo root.
+ball:
+  weights: weights/wasb_tennis_best.pth.tar
+  two_stage: false
+bounce:
+  weights: weights/bounce_catboost.cbm
+inpainter:
+  enabled: true
+  weights: weights/InpaintNet_best.pt
+  device: cpu
+  window_mode: single
+  max_gap_frames: 60
+  th_h_frac: 0.05
+action:
+  enabled: true
+  pose_weights: weights/yolo26n-pose.pt
+  pose_device: cpu
+  rnn_weights: weights/tennis_rnn.h5
+  player: {}
+rally:
+  online_min_net_crossings: 3
+  pre_roll_seconds: 3.0
+  clip_min_net_crossings: 3
+  clip_min_duration_seconds: 2.0

@@ -1,12 +1,5 @@
-# Core — required
+# Core — ball-only pipeline (no CNNs).  Everything below this file will
+# also be installed if you pull in requirements-ml.txt.
 numpy>=1.19,<2.0
 opencv-python-headless>=4.6,<5.0
 PyYAML>=5.4
-
-# Optional: CNN-based court & ball detection (V1/V2)
-# Install with: pip install -r requirements-ml.txt
-# torch>=1.9
-# torchvision>=0.10
-# onnxruntime>=1.10       # CPU inference for exported TrackNet
-# catboost>=1.0           # learned bounce detector
-# scipy>=1.5              # spline interpolation for bounce pre-processing

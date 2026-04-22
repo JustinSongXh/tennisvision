@@ -1,5 +1,7 @@
 # Model weights
-# (tracked in repo)
+# (source checkpoints are tracked; runtime-generated ONNX exports aren't)
+weights/*.onnx
+weights/*.onnx.data
 
 # Sample media (also large)
 *.mp4
