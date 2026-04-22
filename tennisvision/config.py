@@ -126,7 +126,11 @@ DEFAULTS: dict = {
         #
         # All temporal knobs are in SECONDS; multiplied by fps at runtime.
         "enabled": True,
-        "online_silence_seconds": 3.0,     # gap that ends an activity burst
+        "online_silence_seconds": 3.0,     # ball-free gap that ends an activity burst
+        "online_crossing_silence_seconds": 4.0,  # force-close when ball is still in play
+                                                 # but no net crossing for this long
+                                                 # (catches pickup / dribble / toss gaps
+                                                 # between real rallies); 0 = disabled
         "online_min_net_crossings": 3,     # crossings needed to confirm a rally
         "pre_roll_seconds": 1.0,           # lead-in before first ball motion
         "post_roll_seconds": 1.0,          # kept after last ball motion

@@ -433,17 +433,21 @@ def run(
     online_det = None
     if rally_enabled:
         from .rally import OnlineRallyDetector
+        crossing_silence_thresh = int(round(
+            float(_rcfg.get("online_crossing_silence_seconds", 0.0)) * max(fps, 1.0)))
         online_det = OnlineRallyDetector(
             net_y_px=net_y_px,
             silence_thresh_frames=silence_thresh,
+            crossing_silence_thresh_frames=crossing_silence_thresh,
             min_net_crossings=int(_rcfg.get("online_min_net_crossings", 3)),
             pre_roll_frames=pre_roll_frames,
             post_roll_frames=post_roll_frames,
             total_frames=total,
         )
-        print("[rally] online detector: silence=%.1fs  min_crossings=%d  "
-              "pre/post_roll=%.1fs/%.1fs  net_y_px=%.0f" % (
+        print("[rally] online detector: silence=%.1fs  crossing_silence=%.1fs  "
+              "min_crossings=%d  pre/post_roll=%.1fs/%.1fs  net_y_px=%.0f" % (
                   float(_rcfg.get("online_silence_seconds", 3.0)),
+                  float(_rcfg.get("online_crossing_silence_seconds", 0.0)),
                   int(_rcfg.get("online_min_net_crossings", 3)),
                   float(_rcfg.get("pre_roll_seconds", 1.0)),
                   float(_rcfg.get("post_roll_seconds", 1.0)),

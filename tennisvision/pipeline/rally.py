@@ -57,17 +57,24 @@ class OnlineRallyDetector:
 
     def __init__(self, *, net_y_px: float, silence_thresh_frames: int,
                  min_net_crossings: int, pre_roll_frames: int,
-                 post_roll_frames: int, total_frames: int):
+                 post_roll_frames: int, total_frames: int,
+                 crossing_silence_thresh_frames: int = 0):
         self.net_y_px = float(net_y_px)
         self.silence_thresh = max(1, int(silence_thresh_frames))
         self.min_crossings = max(1, int(min_net_crossings))
         self.pre_roll = max(0, int(pre_roll_frames))
         self.post_roll = max(0, int(post_roll_frames))
         self.total = max(1, int(total_frames))
+        # If > 0, force-close the current activity when no net crossing
+        # has been observed for this many frames — catches ball-pickup /
+        # dribble / toss between real rallies that would otherwise keep
+        # the activity burst open (the ball is still being detected).
+        self.crossing_silence_thresh = max(0, int(crossing_silence_thresh_frames))
 
         self._activity_start: Optional[int] = None
         self._crossings = 0
         self._last_side: Optional[int] = None
+        self._last_crossing_frame: Optional[int] = None
         self._silent = 0
         self._activity_frames = 0
         self.rallies: list[Rally] = []
@@ -80,6 +87,7 @@ class OnlineRallyDetector:
                 self._activity_start = frame_idx
                 self._crossings = 0
                 self._last_side = None
+                self._last_crossing_frame = frame_idx
                 self._activity_frames = 0
             self._silent = 0
             self._activity_frames += 1
@@ -96,33 +104,56 @@ class OnlineRallyDetector:
                 side = -1 if ball_y < self.net_y_px else 1
                 if self._last_side is not None and side != self._last_side:
                     self._crossings += 1
+                    self._last_crossing_frame = frame_idx
                 self._last_side = side
+
+            # Force-close if the ball has been in play but no net crossing
+            # happened for too long (typical of pickup + dribble + toss
+            # between real rallies).  We cap the rally at the LAST crossing
+            # frame so the trailing non-crossing frames don't pollute it,
+            # then immediately start a new burst from the current frame so
+            # fresh crossings can still open another rally.
+            if (self.crossing_silence_thresh > 0
+                    and self._crossings >= 1
+                    and self._last_crossing_frame is not None
+                    and (frame_idx - self._last_crossing_frame)
+                        >= self.crossing_silence_thresh):
+                last_cross = self._last_crossing_frame
+                self._close_at(last_cross)
+                # Open a fresh burst starting at the current frame so
+                # a new rally can form immediately if play resumes.
+                self._activity_start = frame_idx
+                self._crossings = 0
+                self._last_side = None if ball_y is None else (
+                    -1 if ball_y < self.net_y_px else 1)
+                self._last_crossing_frame = frame_idx
+                self._activity_frames = 1
+                self._silent = 0
         else:
             if self._activity_start is not None:
                 self._silent += 1
                 if self._silent >= self.silence_thresh:
-                    self._close(frame_idx)
+                    self._close_at(frame_idx - self._silent)
+                    self._reset()
 
     def finalize(self, last_frame_idx: int) -> None:
         """Close any still-open activity when the video ends."""
         if self._activity_start is not None:
-            # Pretend the silence period had already elapsed so `_close`
-            # computes the end frame using the last seen frame.
-            self._silent = self.silence_thresh
-            self._close(last_frame_idx + self.silence_thresh)
+            self._close_at(last_frame_idx)
+            self._reset()
 
     # ------------------------------------------------------------------
-    def _close(self, cur_frame: int) -> None:
+    def _close_at(self, activity_end_frame: int) -> None:
+        """Emit a Rally ending at the given activity end frame (before
+        post_roll is applied).  Does NOT reset state — callers are
+        responsible for calling _reset() or setting up a new burst."""
         if self._crossings >= self.min_crossings:
-            start = max(1, (self._activity_start or cur_frame) - self.pre_roll)
+            start = max(1, (self._activity_start or activity_end_frame) - self.pre_roll)
             # Don't let pre_roll back up into the previous rally's
-            # padded tail — that would produce overlapping rallies (the
-            # cut video would replay those frames, and per-frame rally
-            # lookup would be ambiguous).
+            # padded tail — that would produce overlapping rallies.
             if self.rallies:
                 start = max(start, self.rallies[-1].end_frame + 1)
-            end_activity = cur_frame - self._silent
-            end = min(self.total, end_activity + self.post_roll)
+            end = min(self.total, activity_end_frame + self.post_roll)
             if end >= start:
                 self.rallies.append(Rally(
                     idx=len(self.rallies),
@@ -131,9 +162,12 @@ class OnlineRallyDetector:
                     n_events=self._activity_frames,
                     net_crossings=self._crossings,
                 ))
+
+    def _reset(self) -> None:
         self._activity_start = None
         self._crossings = 0
         self._last_side = None
+        self._last_crossing_frame = None
         self._silent = 0
         self._activity_frames = 0
 
