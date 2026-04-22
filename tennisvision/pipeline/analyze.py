@@ -120,7 +120,7 @@ def _build_stroke_recognizer(acfg, calib=None):
     )
 
 
-def _build_ball_detector(bcfg):
+def _build_ball_detector(bcfg, calib=None):
     """Return (detector_obj, detect_fn). `detect_fn(frame) -> list[(x, y)]`."""
     name = bcfg["detector"]
     if name == "classical":
@@ -138,18 +138,31 @@ def _build_ball_detector(bcfg):
     if name == "wasb":
         if not _HAS_WASB:
             raise RuntimeError("WASB requires torch; `pip install torch`")
-        det = WASBBallDetector(WASBConfig(
+        from ..ball.wasb import TwoStageBallDetector
+        wcfg = WASBConfig(
             weights=bcfg["weights"],
             device=bcfg.get("device", "cpu"),
             runtime=bcfg.get("runtime", "auto"),
             onnx_path=bcfg.get("onnx_path", None),
             score_threshold=bcfg.get("score_threshold", 0.5),
             max_disp=bcfg.get("max_disp", 300.0),
-        ))
+        )
+        use_two_stage = bool(bcfg.get("two_stage", True)) and calib is not None
+        det = TwoStageBallDetector(
+            wcfg, calib=calib,
+            dedup_px=float(bcfg.get("two_stage_dedup_px", 60.0)),
+        ) if use_two_stage else WASBBallDetector(wcfg)
+        if use_two_stage:
+            print("[wasb] two-stage enabled (main + far-crop)")
         def _run(frame):
             det.push_frame(frame)
-            pt = det.detect()
-            return [pt] if pt is not None else []
+            result = det.detect()
+            # Main detector returns Optional[(x,y)]; TwoStage returns list.
+            if result is None:
+                return []
+            if isinstance(result, list):
+                return result
+            return [result]
         return det, _run
     raise NotImplementedError("ball.detector=%r not supported" % name)
 
@@ -286,7 +299,7 @@ def run(
     progress_every: int = 100,
 ) -> AnalyzeResult:
     import time
-    ball_det, ball_detect_fn = _build_ball_detector(cfg["ball"])
+    ball_det, ball_detect_fn = _build_ball_detector(cfg["ball"], calib=calib)
     tcfg = cfg["tracker"]
     tracker = MultiTrackManager(TrackerConfig(
         gate_px=tcfg["gate_px"], max_gap_frames=tcfg["max_gap_frames"],

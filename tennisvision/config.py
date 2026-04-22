@@ -26,6 +26,9 @@ DEFAULTS: dict = {
         "onnx_path": None,
         "score_threshold": 0.5,
         "max_disp": 300.0,
+        "two_stage": True,             # run a second WASB pass on a far-court crop
+                                       # (needs calib); off → single full-frame pass
+        "two_stage_dedup_px": 60.0,    # merge main + far candidates within this distance
         "hsv_low":  [25, 60, 120],
         "hsv_high": [50, 255, 255],
         "min_area": 3,
