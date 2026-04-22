@@ -2,7 +2,7 @@
 # in-repo weights directory so paths resolve when cwd is the repo root.
 ball:
   weights: weights/wasb_tennis_best.pth.tar
-  two_stage: false
+  two_stage: true
 bounce:
   weights: weights/bounce_catboost.cbm
 inpainter:
@@ -20,6 +20,7 @@ action:
   player: {}
 rally:
   online_min_net_crossings: 3
-  pre_roll_seconds: 3.0
+  pre_roll_seconds: 1.5
+  post_roll_seconds: 1.5
   clip_min_net_crossings: 3
   clip_min_duration_seconds: 2.0

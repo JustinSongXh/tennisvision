@@ -618,9 +618,13 @@ def run(
               % (dt, total_rally_frames,
                  total_rally_frames / max(dt, 1e-6),
                  len(stroke_events)), flush=True)
-    elif parallel_pose and pose_executor is not None:
-        # No rallies detected — still need to clean up the idle executor.
-        pose_executor.shutdown(wait=True)
+
+        # Backfill rally.n_strokes now that Pass 1b is done so the
+        # rallies.json downstream reflects the actual stroke counts.
+        for r in rallies:
+            r.n_strokes = sum(
+                1 for ev in stroke_events
+                if r.start_frame <= ev.frame <= r.end_frame)
 
         # Summary by label / player.
         by_label: dict = {}
@@ -637,6 +641,9 @@ def run(
         for pid in sorted(by_player.keys()):
             parts = ", ".join("%s=%d" % kv for kv in sorted(by_player[pid].items()))
             print("[action]   player #%d: %s" % (pid, parts), flush=True)
+    elif parallel_pose and pose_executor is not None:
+        # No rallies detected — still need to clean up the idle executor.
+        pose_executor.shutdown(wait=True)
 
     # Build the frame→rally lookup used in Pass 2 for HUD / minimap reset.
     frame_to_rally: list = [-1] * (total + 2)

@@ -115,6 +115,12 @@ class OnlineRallyDetector:
     def _close(self, cur_frame: int) -> None:
         if self._crossings >= self.min_crossings:
             start = max(1, (self._activity_start or cur_frame) - self.pre_roll)
+            # Don't let pre_roll back up into the previous rally's
+            # padded tail — that would produce overlapping rallies (the
+            # cut video would replay those frames, and per-frame rally
+            # lookup would be ambiguous).
+            if self.rallies:
+                start = max(start, self.rallies[-1].end_frame + 1)
             end_activity = cur_frame - self._silent
             end = min(self.total, end_activity + self.post_roll)
             if end >= start:
