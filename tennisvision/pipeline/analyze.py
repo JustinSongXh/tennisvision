@@ -360,12 +360,14 @@ def run(
     # stroke_rec.reset() to flush any stale pose window from the old rally.
     _rcfg = cfg.get("rally") or {}
     online_gating = bool(_rcfg.get("online_gating", False)) and stroke_rec is not None
-    silence_thresh = max(1, int(_rcfg.get("online_silence_frames", 90)))
+    silence_thresh = max(1, int(round(
+        float(_rcfg.get("online_silence_seconds", 3.0)) * max(fps, 1.0))))
     gate_in_rally = False
     silent_frames = 0
     if online_gating:
-        print("[rally] online gating enabled (silence_thresh=%d frames)" %
-              silence_thresh, flush=True)
+        print("[rally] online gating enabled (silence=%.1fs → %d frames @ %.1f fps)"
+              % (float(_rcfg.get("online_silence_seconds", 3.0)),
+                 silence_thresh, fps), flush=True)
 
     print("[pass 1] tracking %d frames ..." % total, flush=True)
     t0 = time.time()
@@ -514,8 +516,10 @@ def run(
             fps=fps,
             gap_seconds=float(rcfg_rally.get("gap_seconds", 3.0)),
             min_events=int(rcfg_rally.get("min_events", 3)),
-            pre_roll_frames=int(rcfg_rally.get("pre_roll_frames", 30)),
-            post_roll_frames=int(rcfg_rally.get("post_roll_frames", 30)),
+            pre_roll_frames=int(round(
+                float(rcfg_rally.get("pre_roll_seconds", 1.0)) * max(fps, 1.0))),
+            post_roll_frames=int(round(
+                float(rcfg_rally.get("post_roll_seconds", 1.0)) * max(fps, 1.0))),
             total_frames=total,
         )
         print("[rally] detected %d rallies" % len(rallies), flush=True)

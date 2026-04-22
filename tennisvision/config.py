@@ -117,25 +117,28 @@ DEFAULTS: dict = {
         # and emit a cut video containing only the rally segments.  The
         # cut video re-uses the annotated Pass-2 output — no extra model
         # passes required.
+        #
+        # All temporal knobs are expressed in SECONDS so the config stays
+        # valid at any fps; they're multiplied by the video's fps at run
+        # time to get frame counts.
         "enabled": True,
         "gap_seconds": 3.0,        # events more than this apart start a new rally
         "min_events": 3,           # drop short groups (stray detections)
-        "pre_roll_frames": 30,     # ~1s before first event at 30fps
-        "post_roll_frames": 30,    # ~1s after last event
+        "pre_roll_seconds": 1.0,   # seconds of lead-in before first event
+        "post_roll_seconds": 1.0,  # seconds kept after last event
         "separator_seconds": 1.0,  # black "Rally N" title between clips
         # Output paths: None → derive from analyze --out by replacing
         # `.mp4` with `_rally.mp4` / `_rallies.json`.
         "clip_path": None,
         "json_path": None,
-        # Pass-1 optimization: use a simple state machine to skip the pose
-        # tracker + stroke classifier during obvious non-rally stretches
-        # (no ball detected for N frames).  Ball detection still runs every
-        # frame so the system can recover quickly when a rally resumes.
-        # Stroke events during the first ~window_frames of a new rally may
-        # be missed because the pose buffer needs time to fill — trade-off
-        # accepted.  Default OFF to preserve current behavior.
+        # Pass-1 optimization: state machine that skips the pose tracker
+        # and stroke classifier during obvious non-rally stretches.  Ball
+        # detection still runs every frame so the system can recover
+        # within one frame once a rally resumes.  On entering a new rally
+        # the stroke classifier is reset to flush its stale pose window.
+        # Default OFF to preserve current behavior.
         "online_gating": False,
-        "online_silence_frames": 90,   # ~3s at 30 fps
+        "online_silence_seconds": 3.0,   # no ball activity for this many seconds → skip
     },
 }
 
