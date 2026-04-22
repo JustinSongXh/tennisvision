@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import asdict, dataclass
-from typing import Iterable
+from typing import Iterable, Optional
 
 import cv2
 import numpy as np
@@ -32,10 +32,104 @@ class Rally:
     start_frame: int
     end_frame: int
     n_events: int
-    # Populated by validate_rallies(); useful for downstream selection
-    # (e.g. a stricter net-crossing threshold for the clip video).
+    # Populated by the online detector / validate_rallies(); useful for
+    # downstream selection (e.g. a stricter net-crossing threshold for
+    # the clip video).
     net_crossings: int = 0
     n_strokes: int = 0
+
+
+class OnlineRallyDetector:
+    """State machine fed one frame at a time during Pass 1a.
+
+    Consumes (frame_idx, cand_xys, champion) each frame and emits a
+    `Rally` as soon as it confirms the previous activity burst was a
+    real rally (≥ min_net_crossings net transitions).  Rally start is
+    the FIRST frame of ball activity in that burst — not the frame of
+    the 3rd crossing — because the serve toss and initial motion are
+    part of the rally.
+
+    Net-side is decided by `p.y < net_y_px` (midpoint approximation).
+    Good enough for binary "did the ball end up on the other half" over
+    many frames, even though it breaks down for airborne balls at the
+    instant of crossing.
+    """
+
+    def __init__(self, *, net_y_px: float, silence_thresh_frames: int,
+                 min_net_crossings: int, pre_roll_frames: int,
+                 post_roll_frames: int, total_frames: int):
+        self.net_y_px = float(net_y_px)
+        self.silence_thresh = max(1, int(silence_thresh_frames))
+        self.min_crossings = max(1, int(min_net_crossings))
+        self.pre_roll = max(0, int(pre_roll_frames))
+        self.post_roll = max(0, int(post_roll_frames))
+        self.total = max(1, int(total_frames))
+
+        self._activity_start: Optional[int] = None
+        self._crossings = 0
+        self._last_side: Optional[int] = None
+        self._silent = 0
+        self._activity_frames = 0
+        self.rallies: list[Rally] = []
+
+    # ------------------------------------------------------------------
+    def observe(self, frame_idx: int, cand_xys: list, champion) -> None:
+        has_ball = bool(cand_xys)
+        if has_ball:
+            if self._activity_start is None:
+                self._activity_start = frame_idx
+                self._crossings = 0
+                self._last_side = None
+                self._activity_frames = 0
+            self._silent = 0
+            self._activity_frames += 1
+
+            # Prefer the tracker's current-frame ball position (cleaner),
+            # fall back to the first raw candidate.
+            ball_y = None
+            if (champion is not None and champion.pts
+                    and champion.last_det_frame == frame_idx):
+                ball_y = float(champion.pts[-1].y)
+            elif cand_xys:
+                ball_y = float(cand_xys[0][1])
+            if ball_y is not None:
+                side = -1 if ball_y < self.net_y_px else 1
+                if self._last_side is not None and side != self._last_side:
+                    self._crossings += 1
+                self._last_side = side
+        else:
+            if self._activity_start is not None:
+                self._silent += 1
+                if self._silent >= self.silence_thresh:
+                    self._close(frame_idx)
+
+    def finalize(self, last_frame_idx: int) -> None:
+        """Close any still-open activity when the video ends."""
+        if self._activity_start is not None:
+            # Pretend the silence period had already elapsed so `_close`
+            # computes the end frame using the last seen frame.
+            self._silent = self.silence_thresh
+            self._close(last_frame_idx + self.silence_thresh)
+
+    # ------------------------------------------------------------------
+    def _close(self, cur_frame: int) -> None:
+        if self._crossings >= self.min_crossings:
+            start = max(1, (self._activity_start or cur_frame) - self.pre_roll)
+            end_activity = cur_frame - self._silent
+            end = min(self.total, end_activity + self.post_roll)
+            if end >= start:
+                self.rallies.append(Rally(
+                    idx=len(self.rallies),
+                    start_frame=start,
+                    end_frame=end,
+                    n_events=self._activity_frames,
+                    net_crossings=self._crossings,
+                ))
+        self._activity_start = None
+        self._crossings = 0
+        self._last_side = None
+        self._silent = 0
+        self._activity_frames = 0
 
 
 def detect_rallies(

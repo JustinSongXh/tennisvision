@@ -113,43 +113,31 @@ DEFAULTS: dict = {
         "dir": None,
     },
     "rally": {
-        # Group ball-activity events (tracks, bounces, strokes) into rallies
-        # and emit a cut video containing only the rally segments.  The
-        # cut video re-uses the annotated Pass-2 output — no extra model
-        # passes required.
+        # Online rally detection runs inside Pass 1a (ball-only scan).
+        # A rally is an activity burst of ball detections bounded by
+        # `online_silence_seconds` of ball-free frames on both sides,
+        # containing at least `online_min_net_crossings` transitions of
+        # the ball across the net (net_y is the midpoint projection of
+        # NET_Y via H_real_to_img — approximate but sufficient for a
+        # binary "is this a real rally" decision over many frames).
         #
-        # All temporal knobs are expressed in SECONDS so the config stays
-        # valid at any fps; they're multiplied by the video's fps at run
-        # time to get frame counts.
+        # After detection, Pass 1b runs pose + stroke classifier ONLY
+        # on the frames inside each rally.
+        #
+        # All temporal knobs are in SECONDS; multiplied by fps at runtime.
         "enabled": True,
-        "gap_seconds": 3.0,        # events more than this apart start a new rally
-        "min_events": 3,           # drop short groups (stray detections)
-        "pre_roll_seconds": 1.0,   # seconds of lead-in before first event
-        "post_roll_seconds": 1.0,  # seconds kept after last event
-        "separator_seconds": 1.0,  # black "Rally N" title between clips
-        # Output paths: None → derive from analyze --out by replacing
-        # `.mp4` with `_rally.mp4` / `_rallies.json`.
+        "online_silence_seconds": 3.0,     # gap that ends an activity burst
+        "online_min_net_crossings": 3,     # crossings needed to confirm a rally
+        "pre_roll_seconds": 1.0,           # lead-in before first ball motion
+        "post_roll_seconds": 1.0,          # kept after last ball motion
+        "separator_seconds": 1.0,          # "Rally N" title between cut clips
+        # Output paths: None → derive from --out by replacing `.mp4`
+        # with `_rally.mp4` / `_rallies.json`.
         "clip_path": None,
         "json_path": None,
-        # Pass-1 optimization: state machine that skips the pose tracker
-        # and stroke classifier during obvious non-rally stretches.  Ball
-        # detection still runs every frame so the system can recover
-        # within one frame once a rally resumes.  On entering a new rally
-        # the stroke classifier is reset to flush its stale pose window.
-        # Default OFF to preserve current behavior.
-        "online_gating": False,
-        "online_silence_seconds": 3.0,   # no ball activity for this many seconds → skip
-        # Quality filter for detected rallies: drop candidates that look
-        # like ball-pickup / warm-up instead of real cross-court play.
-        # A rally is kept if EITHER:
-        #   - ball trajectory crosses the net ≥ min_net_crossings times, OR
-        #   - ≥ min_stroke_events non-neutral RNN strokes fire within it.
-        # Set both to 0 to disable filtering (old behavior).
-        "min_net_crossings": 1,
-        "min_stroke_events": 0,
-        # Stricter filter applied ONLY to the cut highlight video (and
-        # the _rallies.json stays the full list).  Cascades as AND.
-        # Tune up to trim short scrappy rallies and ball-pickup clips.
+        # Stricter filter applied ONLY to the cut highlight video; the
+        # full _rallies.json still lists every rally Pass 1a detected.
+        # Both thresholds at 0 → include every detected rally in the cut.
         "clip_min_net_crossings": 3,
         "clip_min_duration_seconds": 2.0,
     },

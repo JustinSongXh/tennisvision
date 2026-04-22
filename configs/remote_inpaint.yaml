@@ -19,7 +19,6 @@ action:
   rnn_weights:  /root/personal/tennis_rnn.h5
   player: {}
 rally:
-  online_gating: true            # skip pose+stroke during non-rally gaps
-  min_stroke_events: 2           # secondary signal in addition to net-crossing
-  clip_min_net_crossings: 3      # cut video requires ≥3 net crossings
+  online_min_net_crossings: 3    # confirm rally on ≥3 net transitions in one burst
+  clip_min_net_crossings: 3      # cut video keeps all such rallies
   clip_min_duration_seconds: 2.0 # and at least 2s long

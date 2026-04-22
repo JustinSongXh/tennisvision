@@ -354,32 +354,51 @@ def run(
     tail_len = tcfg["render_tail"]
     frame_idx = 0
 
-    # Online gating: skip the expensive pose + stroke pass during obvious
-    # non-rally stretches.  Ball detection still runs every frame so a
-    # resuming rally is caught within one frame; once recovered we call
-    # stroke_rec.reset() to flush any stale pose window from the old rally.
+    # ------------------------------------------------------------------
+    # PASS 1a — ball detection + tracking + online rally detection.
+    # Pose / RNN are DEFERRED to Pass 1b so they only run on confirmed
+    # rally frames.
+    # ------------------------------------------------------------------
     _rcfg = cfg.get("rally") or {}
-    online_gating = bool(_rcfg.get("online_gating", False)) and stroke_rec is not None
+    rally_enabled = bool(_rcfg.get("enabled", True))
+    net_center = np.array([ref.COURT_WIDTH_M / 2.0, ref.NET_Y, 1.0])
+    p_net = calib.H_real_to_img @ net_center
+    net_y_px = float(p_net[1] / p_net[2])
     silence_thresh = max(1, int(round(
         float(_rcfg.get("online_silence_seconds", 3.0)) * max(fps, 1.0))))
-    gate_in_rally = False
-    silent_frames = 0
-    if online_gating:
-        print("[rally] online gating enabled (silence=%.1fs → %d frames @ %.1f fps)"
-              % (float(_rcfg.get("online_silence_seconds", 3.0)),
-                 silence_thresh, fps), flush=True)
+    pre_roll_frames = int(round(
+        float(_rcfg.get("pre_roll_seconds", 1.0)) * max(fps, 1.0)))
+    post_roll_frames = int(round(
+        float(_rcfg.get("post_roll_seconds", 1.0)) * max(fps, 1.0)))
 
-    print("[pass 1] tracking %d frames ..." % total, flush=True)
+    online_det = None
+    if rally_enabled:
+        from .rally import OnlineRallyDetector
+        online_det = OnlineRallyDetector(
+            net_y_px=net_y_px,
+            silence_thresh_frames=silence_thresh,
+            min_net_crossings=int(_rcfg.get("online_min_net_crossings", 3)),
+            pre_roll_frames=pre_roll_frames,
+            post_roll_frames=post_roll_frames,
+            total_frames=total,
+        )
+        print("[rally] online detector: silence=%.1fs  min_crossings=%d  "
+              "pre/post_roll=%.1fs/%.1fs  net_y_px=%.0f" % (
+                  float(_rcfg.get("online_silence_seconds", 3.0)),
+                  int(_rcfg.get("online_min_net_crossings", 3)),
+                  float(_rcfg.get("pre_roll_seconds", 1.0)),
+                  float(_rcfg.get("post_roll_seconds", 1.0)),
+                  net_y_px), flush=True)
+
+    print("[pass 1a] ball+tracker only, %d frames ..." % total, flush=True)
     t0 = time.time()
     t_last = t0
-    gated_skips = 0
     while True:
         ret, frame = cap.read()
         if not ret:
             break
         frame_idx += 1
 
-        # snapshot track ids before update so we can detect retired ones
         before_ids = {t.id: t for t in tracker.tracks}
 
         cand_xys = _filter_cands(ball_detect_fn(frame))
@@ -391,31 +410,8 @@ def run(
             if tid not in after_ids and t.validated:
                 retired_tracks[tid] = t
 
-        # ------ online rally gating state machine ------
-        if online_gating:
-            has_activity = bool(cand_xys) or (champion is not None and champion.validated)
-            if not gate_in_rally:
-                if has_activity:
-                    gate_in_rally = True
-                    silent_frames = 0
-                    stroke_rec.reset()     # flush stale pose window / tracks
-            else:
-                if has_activity:
-                    silent_frames = 0
-                else:
-                    silent_frames += 1
-                    if silent_frames >= silence_thresh:
-                        gate_in_rally = False
-
-        if stroke_rec is not None and (not online_gating or gate_in_rally):
-            ball_xy: Optional[tuple] = None
-            if champion is not None and champion.pts:
-                last_pt = champion.pts[-1]
-                ball_xy = (last_pt.x, last_pt.y)
-            stroke_events.extend(stroke_rec.push_frame(frame, frame_idx,
-                                                        ball_xy=ball_xy))
-        elif online_gating and not gate_in_rally:
-            gated_skips += 1
+        if online_det is not None:
+            online_det.observe(frame_idx, cand_xys, champion)
 
         fs = _FrameState(n_cands=len(cand_xys), n_tracks=len(tracker.tracks))
         if champion is not None:
@@ -425,42 +421,30 @@ def run(
                 (p.x, p.y, p.frame) for p in champion.pts
                 if frame_idx - p.frame <= tail_len
             ]
-        if stroke_rec is not None:
-            fs.player_bboxes = dict(getattr(stroke_rec, "last_detections", {}))
         frame_states[frame_idx] = fs
 
         if frame_idx % progress_every == 0:
             now = time.time()
             proc_fps = progress_every / max(now - t_last, 1e-6)
             eta = (total - frame_idx) / max(proc_fps, 1e-6)
-            print("  frame %d / %d  %.1f fps  eta %.0fs  (%d retired tracks)"
-                  % (frame_idx, total, proc_fps, eta, len(retired_tracks)),
+            n_rallies = len(online_det.rallies) if online_det is not None else 0
+            print("  [pass 1a] frame %d / %d  %.1f fps  eta %.0fs  "
+                  "(%d retired tracks, %d rallies)"
+                  % (frame_idx, total, proc_fps, eta,
+                     len(retired_tracks), n_rallies),
                   flush=True)
             t_last = now
     cap.release()
-    print("[pass 1] done in %.1fs  (%d validated tracks)" %
-          (time.time() - t0, sum(1 for t in retired_tracks.values() if t.validated)),
+    if online_det is not None:
+        online_det.finalize(frame_idx)
+        rallies = online_det.rallies
+    else:
+        rallies = []
+    print("[pass 1a] done in %.1fs  (%d validated tracks, %d rallies)" %
+          (time.time() - t0,
+           sum(1 for t in retired_tracks.values() if t.validated),
+           len(rallies)),
           flush=True)
-    if online_gating:
-        pct = 100.0 * gated_skips / max(frame_idx, 1)
-        print("[rally] online gating: %d / %d frames skipped pose+stroke (%.0f%%)"
-              % (gated_skips, frame_idx, pct), flush=True)
-
-    if stroke_rec is not None:
-        by_label: dict = {}
-        by_player: dict = {}
-        for ev in stroke_events:
-            by_label[ev.label] = by_label.get(ev.label, 0) + 1
-            if ev.player_id is not None:
-                by_player.setdefault(ev.player_id, {})
-                by_player[ev.player_id][ev.label] = \
-                    by_player[ev.player_id].get(ev.label, 0) + 1
-        label_summary = ", ".join("%s=%d" % kv for kv in sorted(by_label.items())) or "(none)"
-        print("[action] %d stroke events: %s" % (len(stroke_events), label_summary),
-              flush=True)
-        for pid in sorted(by_player.keys()):
-            parts = ", ".join("%s=%d" % kv for kv in sorted(by_player[pid].items()))
-            print("[action]   player #%d: %s" % (pid, parts), flush=True)
 
     # Also include tracks still alive after the last frame
     for t in tracker.tracks:
@@ -494,61 +478,77 @@ def run(
           (len(events), len(bounces_court)), flush=True)
 
     # ------------------------------------------------------------------
-    # RALLY DETECTION (before Pass 2 so the renderer can clear HUD /
-    # minimap at rally boundaries instead of accumulating across the
-    # whole video).
+    # PASS 1b — pose + stroke classifier, per detected rally only.
+    # We reopen the video and seek to each rally's start, reset the
+    # tracker so ByteTrack IDs don't leak across rallies, and feed
+    # only those frames through pose/RNN.  `ball_xy` is pulled from
+    # frame_states (populated in Pass 1a) so the stroke classifier's
+    # ball-proximity gate still works per-frame.
     # ------------------------------------------------------------------
-    rcfg_rally = cfg.get("rally") or {}
-    rally_enabled = bool(rcfg_rally.get("enabled", True))
-    rallies: list = []
-    frame_to_rally: list = []     # frame_idx -> rally index, or -1
-    if rally_enabled:
-        from .rally import detect_rallies
-
-        event_frames: list = []
-        for t in all_tracks:
-            event_frames.extend(p.frame for p in t.pts)
-        event_frames.extend(f for (_, _, f) in bounces_court)
-        event_frames.extend(ev.frame for ev in stroke_events)
-
-        rallies = detect_rallies(
-            event_frames,
-            fps=fps,
-            gap_seconds=float(rcfg_rally.get("gap_seconds", 3.0)),
-            min_events=int(rcfg_rally.get("min_events", 3)),
-            pre_roll_frames=int(round(
-                float(rcfg_rally.get("pre_roll_seconds", 1.0)) * max(fps, 1.0))),
-            post_roll_frames=int(round(
-                float(rcfg_rally.get("post_roll_seconds", 1.0)) * max(fps, 1.0))),
-            total_frames=total,
-        )
-        n_raw = len(rallies)
-
-        # Quality filter: drop ball-pickup / warm-up candidates that have
-        # no net crossing and no real stroke events.
-        min_cross = int(rcfg_rally.get("min_net_crossings", 1))
-        min_strokes = int(rcfg_rally.get("min_stroke_events", 0))
-        if min_cross > 0 or min_strokes > 0:
-            from .rally import validate_rallies
-            net_center = np.array([ref.COURT_WIDTH_M / 2.0, ref.NET_Y, 1.0])
-            p_net = calib.H_real_to_img @ net_center
-            net_y_px = float(p_net[1] / p_net[2])
-            rallies = validate_rallies(
-                rallies, all_tracks, stroke_events, net_y_px,
-                min_net_crossings=min_cross,
-                min_stroke_events=min_strokes,
-            )
-            print("[rally] detected %d raw -> %d after quality filter "
-                  "(min_net_crossings=%d, min_stroke_events=%d)"
-                  % (n_raw, len(rallies), min_cross, min_strokes),
-                  flush=True)
-        else:
-            print("[rally] detected %d rallies" % n_raw, flush=True)
-
-        frame_to_rally = [-1] * (total + 2)
+    if stroke_rec is not None and rallies:
+        print("[pass 1b] pose + stroke for %d rallies ..." % len(rallies),
+              flush=True)
+        cap = cv2.VideoCapture(video_path)
+        t_pass1b = time.time()
+        total_rally_frames = 0
         for r in rallies:
-            for f in range(r.start_frame, min(r.end_frame, total) + 1):
-                frame_to_rally[f] = r.idx
+            cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, r.start_frame - 1))
+            stroke_rec.reset()
+            n_frames = r.end_frame - r.start_frame + 1
+            rt0 = time.time()
+            for fi in range(r.start_frame, r.end_frame + 1):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                fs = frame_states.get(fi)
+                ball_xy: Optional[tuple] = None
+                if fs is not None and fs.champion_trail:
+                    last_x, last_y, last_f = fs.champion_trail[-1]
+                    if fi - last_f <= 5:
+                        ball_xy = (last_x, last_y)
+                stroke_events.extend(
+                    stroke_rec.push_frame(frame, fi, ball_xy=ball_xy))
+                if fs is not None:
+                    fs.player_bboxes = dict(
+                        getattr(stroke_rec, "last_detections", {}))
+            r_time = max(time.time() - rt0, 1e-6)
+            total_rally_frames += n_frames
+            print("  [pass 1b] rally %d/%d  frames [%d..%d] (%d f)  "
+                  "%.1fs = %.1f fps  crossings=%d  strokes_so_far=%d"
+                  % (r.idx + 1, len(rallies), r.start_frame, r.end_frame,
+                     n_frames, r_time, n_frames / r_time,
+                     r.net_crossings, len(stroke_events)),
+                  flush=True)
+        cap.release()
+        dt = time.time() - t_pass1b
+        print("[pass 1b] done in %.1fs  (%d frames, %.1f fps, %d strokes)"
+              % (dt, total_rally_frames,
+                 total_rally_frames / max(dt, 1e-6),
+                 len(stroke_events)), flush=True)
+
+        # Summary by label / player.
+        by_label: dict = {}
+        by_player: dict = {}
+        for ev in stroke_events:
+            by_label[ev.label] = by_label.get(ev.label, 0) + 1
+            if ev.player_id is not None:
+                by_player.setdefault(ev.player_id, {})
+                by_player[ev.player_id][ev.label] = \
+                    by_player[ev.player_id].get(ev.label, 0) + 1
+        label_summary = ", ".join("%s=%d" % kv for kv in sorted(by_label.items())) or "(none)"
+        print("[action] %d stroke events: %s" % (len(stroke_events), label_summary),
+              flush=True)
+        for pid in sorted(by_player.keys()):
+            parts = ", ".join("%s=%d" % kv for kv in sorted(by_player[pid].items()))
+            print("[action]   player #%d: %s" % (pid, parts), flush=True)
+
+    # Build the frame→rally lookup used in Pass 2 for HUD / minimap reset.
+    frame_to_rally: list = [-1] * (total + 2)
+    for r in rallies:
+        for f in range(r.start_frame, min(r.end_frame, total) + 1):
+            frame_to_rally[f] = r.idx
+
+    rcfg_rally = cfg.get("rally") or {}
 
     # ------------------------------------------------------------------
     # PASS 2 — render
