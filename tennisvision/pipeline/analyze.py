@@ -522,7 +522,28 @@ def run(
                 float(rcfg_rally.get("post_roll_seconds", 1.0)) * max(fps, 1.0))),
             total_frames=total,
         )
-        print("[rally] detected %d rallies" % len(rallies), flush=True)
+        n_raw = len(rallies)
+
+        # Quality filter: drop ball-pickup / warm-up candidates that have
+        # no net crossing and no real stroke events.
+        min_cross = int(rcfg_rally.get("min_net_crossings", 1))
+        min_strokes = int(rcfg_rally.get("min_stroke_events", 0))
+        if min_cross > 0 or min_strokes > 0:
+            from .rally import validate_rallies
+            net_center = np.array([ref.COURT_WIDTH_M / 2.0, ref.NET_Y, 1.0])
+            p_net = calib.H_real_to_img @ net_center
+            net_y_px = float(p_net[1] / p_net[2])
+            rallies = validate_rallies(
+                rallies, all_tracks, stroke_events, net_y_px,
+                min_net_crossings=min_cross,
+                min_stroke_events=min_strokes,
+            )
+            print("[rally] detected %d raw -> %d after quality filter "
+                  "(min_net_crossings=%d, min_stroke_events=%d)"
+                  % (n_raw, len(rallies), min_cross, min_strokes),
+                  flush=True)
+        else:
+            print("[rally] detected %d rallies" % n_raw, flush=True)
 
         frame_to_rally = [-1] * (total + 2)
         for r in rallies:

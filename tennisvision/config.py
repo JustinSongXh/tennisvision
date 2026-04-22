@@ -139,6 +139,14 @@ DEFAULTS: dict = {
         # Default OFF to preserve current behavior.
         "online_gating": False,
         "online_silence_seconds": 3.0,   # no ball activity for this many seconds → skip
+        # Quality filter for detected rallies: drop candidates that look
+        # like ball-pickup / warm-up instead of real cross-court play.
+        # A rally is kept if EITHER:
+        #   - ball trajectory crosses the net ≥ min_net_crossings times, OR
+        #   - ≥ min_stroke_events non-neutral RNN strokes fire within it.
+        # Set both to 0 to disable filtering (old behavior).
+        "min_net_crossings": 1,
+        "min_stroke_events": 0,
     },
 }
 

@@ -78,6 +78,77 @@ def detect_rallies(
     return out
 
 
+def validate_rallies(
+    rallies: list[Rally],
+    tracks: list,
+    stroke_events: list,
+    net_y_px: float,
+    *,
+    min_net_crossings: int = 0,
+    min_stroke_events: int = 0,
+    stroke_labels: tuple = ("forehand", "backhand", "serve"),
+) -> list[Rally]:
+    """Drop candidate rallies that don't show real cross-court play.
+
+    Picking up balls / warm-up dribbling generates enough ball track
+    points and bounces to fool the gap-based grouping in detect_rallies.
+    But the ball never crosses the net and no real strokes fire, so a
+    simple two-signal filter removes them:
+
+    Keep a rally if AT LEAST ONE of:
+      * the ball crosses the net line ≥ min_net_crossings times within
+        [start_frame, end_frame] (any validated track counts)
+      * there are ≥ min_stroke_events non-neutral RNN stroke events in
+        the rally window
+
+    Setting both thresholds to 0 disables filtering.  Rallies that pass
+    are renumbered so idx is consecutive in the returned list.
+    """
+    if min_net_crossings <= 0 and min_stroke_events <= 0:
+        return rallies
+
+    label_set = set(stroke_labels)
+    kept: list[Rally] = []
+    dropped = 0
+    for r in rallies:
+        n_cross = 0
+        if min_net_crossings > 0:
+            for t in tracks:
+                prev_sign = None
+                for p in t.pts:
+                    if not (r.start_frame <= p.frame <= r.end_frame):
+                        continue
+                    # In image coords, smaller y is farther from camera,
+                    # so y < net_y_px means the ball is on the far side.
+                    sign = -1 if p.y < net_y_px else 1
+                    if prev_sign is not None and sign != prev_sign:
+                        n_cross += 1
+                    prev_sign = sign
+
+        n_strokes = 0
+        if min_stroke_events > 0:
+            n_strokes = sum(
+                1 for ev in stroke_events
+                if r.start_frame <= ev.frame <= r.end_frame
+                and getattr(ev, "label", None) in label_set
+            )
+
+        net_ok = min_net_crossings > 0 and n_cross >= min_net_crossings
+        strokes_ok = min_stroke_events > 0 and n_strokes >= min_stroke_events
+        # Keep if ANY enabled filter passes.  Net-crossing is the strong
+        # signal (warm-up / ball pickup stays on one side); the stroke
+        # count is a safety net for legit rallies where tracking was
+        # patchy but the RNN still fired.
+        if net_ok or strokes_ok:
+            kept.append(Rally(idx=len(kept),
+                              start_frame=r.start_frame,
+                              end_frame=r.end_frame,
+                              n_events=r.n_events))
+        else:
+            dropped += 1
+    return kept
+
+
 def write_rally_video(
     src_video: str,
     rallies: list[Rally],
