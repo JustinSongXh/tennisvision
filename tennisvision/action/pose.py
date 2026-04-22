@@ -51,7 +51,7 @@ class YOLOPoseTrackerConfig:
     device: str = "cpu"           # "cpu" | "cuda" | "cuda:0"
     conf: float = 0.3
     iou: float = 0.5
-    imgsz: int = 1280             # 1280 detects far-side players (60px→80px in model)
+    imgsz: int = 640              # standard; small-target accuracy comes from court filter, not imgsz
     tracker: str = "bytetrack.yaml"
     score_threshold: float = 0.2  # per-keypoint visibility threshold (downstream)
     min_bbox_h: int = 60          # px — drop tiny / far detections
@@ -97,15 +97,23 @@ class YOLOPoseTracker:
     def _on_court(self, bbox: Tuple[float, float, float, float]) -> bool:
         if self.calib is None:
             return True
-        x0, _, x1, y1 = bbox
+        x0, y0, x1, y1 = bbox
         foot_x, foot_y = 0.5 * (x0 + x1), y1
         try:
             rx, ry = _proj(self.calib.H_img_to_real, (foot_x, foot_y))
         except Exception:
             return True
         m = self.cfg.court_margin_m
+        h = y1 - y0
+        # Small + far-side detections are usually adjacent-court players
+        # (upper-left / upper-right of frame).  Apply a tight x-margin so
+        # they only pass if they project near our own doubles lane.
+        if h < 150 and ry < _ref.NET_Y:
+            x_margin = 1.0
+        else:
+            x_margin = m
         return (
-            -m <= rx <= _ref.COURT_WIDTH_M + m
+            -x_margin <= rx <= _ref.COURT_WIDTH_M + x_margin
             and -m <= ry <= _ref.COURT_LENGTH_M + m
         )
 
