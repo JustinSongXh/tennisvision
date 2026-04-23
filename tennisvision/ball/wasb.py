@@ -172,9 +172,15 @@ def _export_onnx(pt_weights: str, onnx_path: str,
 
 def _build_ort_session(onnx_path: str):
     available = ort.get_available_providers()
-    providers = []
+    providers: list = []
     if "OpenVINOExecutionProvider" in available:
         providers.append(("OpenVINOExecutionProvider", {"device_type": "CPU_FP32"}))
+    if "CoreMLExecutionProvider" in available:
+        # MLProgram backend is faster than the default NeuralNetwork on
+        # recent macOS; falls back gracefully for ops it doesn't support.
+        providers.append(("CoreMLExecutionProvider", {
+            "ModelFormat": "MLProgram",
+        }))
     providers.append("CPUExecutionProvider")
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -286,3 +292,111 @@ class WASBBallDetector:
 
         self._last_pos = (best[0], best[1])
         return int(round(best[0])), int(round(best[1]))
+
+
+# ----------------------------------------------------------------------
+# Two-stage ball detector: full-frame + far-court crop
+# ----------------------------------------------------------------------
+
+class TwoStageBallDetector:
+    """Runs WASB twice per frame — once on the full frame, once on a tight
+    crop of the far half of the court — and returns the union of their
+    detections.
+
+    Motivation: the far-side ball projects to a few pixels in a 1920×1080
+    frame, and WASB's 512×288 input downsamples it even further.  A
+    calibration-aware crop of the far court narrows the input so the ball
+    takes up several times more pixels in the model's view, recovering
+    detections the full-frame pass misses.
+
+    Each stage has its own 3-frame buffer and its own temporal-gating
+    last position, so gaps in one don't poison the other.  When both
+    stages find a ball within `dedup_px` of each other (same ball, near
+    the net) only the main-pass detection is kept so the tracker doesn't
+    see duplicate candidates that could split its tracks.
+    """
+
+    def __init__(self, cfg: WASBConfig, calib=None, dedup_px: float = 60.0):
+        self._main = WASBBallDetector(cfg)
+        self._far = WASBBallDetector(cfg) if calib is not None else None
+        self._far_crop = self._compute_far_crop(calib) if calib is not None else None
+        self._dedup_px = float(dedup_px)
+
+    @staticmethod
+    def _compute_far_crop(calib):
+        """Far-half court bbox in image pixels, with generous padding.
+
+        Width is bounded by the far doubles corners + lateral margin.
+        Top extends well above the far baseline because balls in flight
+        (especially serves/lobs) can be high above the court.
+        """
+        from ..court.reference import COURT_WIDTH_M, COURT_LENGTH_M, NET_Y
+        pts_m = [
+            (0.0,           COURT_LENGTH_M),  # FL
+            (COURT_WIDTH_M, COURT_LENGTH_M),  # FR
+            (0.0,           NET_Y),
+            (COURT_WIDTH_M, NET_Y),
+        ]
+        xs, ys = [], []
+        for xm, ym in pts_m:
+            v = np.array([xm, ym, 1.0])
+            p = calib.H_real_to_img @ v
+            xs.append(p[0] / p[2])
+            ys.append(p[1] / p[2])
+        baseline_to_net = max(ys) - min(ys)
+        # Ball can fly high above the baseline on serves/lobs — use a
+        # larger top pad than the player version of this crop.
+        top_pad = int(max(250, 4.0 * baseline_to_net))
+        side_pad = 60
+        bot_pad = 40
+        return (
+            int(min(xs) - side_pad),
+            int(min(ys) - top_pad),
+            int(max(xs) + side_pad),
+            int(max(ys) + bot_pad),
+        )
+
+    def push_frame(self, frame: np.ndarray) -> None:
+        self._main.push_frame(frame)
+        if self._far is None:
+            return
+        H, W = frame.shape[:2]
+        x0, y0, x1, y1 = self._far_crop
+        x0 = max(0, x0); y0 = max(0, y0)
+        x1 = min(W, x1); y1 = min(H, y1)
+        if x1 - x0 < 40 or y1 - y0 < 40:
+            return
+        self._far.push_frame(frame[y0:y1, x0:x1])
+
+    def detect(self) -> list:
+        """Returns list of (x, y) candidates in ORIGINAL image coordinates.
+
+        When both stages detect a ball within `dedup_px` of each other
+        we treat it as the same ball (typical near the net) and keep
+        only the main-pass detection so the downstream tracker doesn't
+        see duplicate candidates.
+        """
+        p_main = self._main.detect()
+        p_far = None
+        if self._far is not None:
+            raw = self._far.detect()
+            if raw is not None:
+                x0c = max(0, self._far_crop[0])
+                y0c = max(0, self._far_crop[1])
+                p_far = (raw[0] + x0c, raw[1] + y0c)
+
+        if p_main is not None and p_far is not None:
+            d2 = (p_main[0] - p_far[0]) ** 2 + (p_main[1] - p_far[1]) ** 2
+            if d2 <= self._dedup_px * self._dedup_px:
+                return [p_main]     # same ball — drop the duplicate
+            return [p_main, p_far]
+        if p_main is not None:
+            return [p_main]
+        if p_far is not None:
+            return [p_far]
+        return []
+
+    def reset_tracking(self) -> None:
+        self._main.reset_tracking()
+        if self._far is not None:
+            self._far.reset_tracking()
