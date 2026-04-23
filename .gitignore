@@ -1,6 +1,7 @@
-# Model weights (large, downloaded per-machine)
-weights/*
-!weights/.gitkeep
+# Model weights
+# (source checkpoints are tracked; runtime-generated ONNX exports aren't)
+weights/*.onnx
+weights/*.onnx.data
 
 # Sample media (also large)
 *.mp4
@@ -31,3 +32,6 @@ __pycache__/
 # Editor
 .vscode/
 .idea/
+
+# Claude Code local session state (memory, settings snapshots)
+.claude/

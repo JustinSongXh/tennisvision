@@ -1,14 +1,38 @@
-# Extras for deep-learning models (V1 / V2 / V3)
+# Extras for the full pipeline (ball + court + action).
+#
+# `pip install -r requirements-ml.txt` after creating a clean venv is
+# enough to run `scripts/analyze.py` end-to-end with action.enabled.
+#
+# Version ranges below are the ones verified in a fresh Python 3.9 venv
+# on macOS x86_64; they also work on Linux x86_64 (test machine).
 -r requirements.txt
 
-torch>=1.9
+# --- V1 / V2: ball + court CNNs, trajectory tools ---
+torch>=1.9,<3
 torchvision>=0.10
 catboost>=1.0
 scipy>=1.5
 
-# CPU-accelerated inference — pick ONE:
-#   onnxruntime            -- plain CPU EP (MKL); 3x over raw PyTorch
-#   onnxruntime-openvino   -- adds OpenVINO EP (Intel CPUs only); another 1.5-2x
-# Uncomment whichever applies:
-# onnxruntime>=1.15
+# WASB / TrackNet ONNX path.  `onnx` is needed for the one-off export
+# step the ball detector runs on first use.  `onnxruntime` covers
+# inference; on Mac the CoreMLExecutionProvider is picked up
+# automatically with no extra package.  On Intel CPUs, swap for
+# onnxruntime-openvino (see below).
+onnx>=1.14,<1.18            # upper bound avoids ml-dtypes>=0.5 conflict with TF 2.15
+onnxruntime>=1.15
+
+# --- V3: stroke classification (tennisvision/action/) ---
+# tennis_rnn.h5 was saved with Keras 2; TF 2.16+ defaulted to Keras 3,
+# which rejects that file.  tf-keras provides the Keras 2 API on top of
+# TF 2.x and is what stroke_classifier.py prefers.
+tensorflow>=2.10,<2.16
+tf-keras>=2.15,<2.16
+ultralytics>=8.0
+
+# ---- Optional acceleration backends (install INSTEAD of onnxruntime) --
+# Intel Linux/Windows CPU — another 1.5-2x on WASB inference:
 # onnxruntime-openvino>=1.15
+#
+# macOS / Apple Silicon: onnxruntime already exposes CoreML EP; no
+# additional package needed.  On Intel Macs the speedup is modest
+# because there's no Neural Engine.
