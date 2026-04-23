@@ -148,6 +148,13 @@ DEFAULTS: dict = {
         # Both thresholds at 0 → include every detected rally in the cut.
         "clip_min_net_crossings": 3,
         "clip_min_duration_seconds": 2.0,
+        # Post-Pass-1b pose validation: drop rally candidates that have
+        # too few non-neutral stroke events (forehand / backhand / serve).
+        # Real rallies always show ≥2 strokes; warm-up / pickup / dribble
+        # keeps the ball in play but produces nothing.  Works together
+        # with the trajectory-based filters (crossings + density) as a
+        # second sanity gate.  0 disables.
+        "post_filter_min_strokes": 2,
         # Parallel Pass-1b: kick off a pose worker thread as soon as a
         # rally is confirmed in Pass 1a, so ball detection (main thread,
         # WASB on CoreML/CPU) overlaps with pose + RNN inference.

@@ -634,6 +634,28 @@ def run(
                 1 for ev in stroke_events
                 if r.start_frame <= ev.frame <= r.end_frame)
 
+        # Pose post-filter: trajectory gives us rally candidates, pose
+        # confirms they're real (warm-up / pickup yield few strokes).
+        post_min = int(rcfg_rally.get("post_filter_min_strokes", 0))
+        if post_min > 0:
+            dropped: list = []
+            kept: list = []
+            for r in rallies:
+                if r.n_strokes >= post_min:
+                    r.idx = len(kept)
+                    kept.append(r)
+                else:
+                    dropped.append(r)
+            if dropped:
+                print("[rally] post-filter: %d rallies dropped for n_strokes<%d "
+                      "(kept %d)" % (len(dropped), post_min, len(kept)),
+                      flush=True)
+                for r in dropped:
+                    print("  dropped rally [%d..%d] crossings=%d n_strokes=%d"
+                          % (r.start_frame, r.end_frame, r.net_crossings,
+                             r.n_strokes), flush=True)
+            rallies = kept    # frame_to_rally gets rebuilt below
+
         # Summary by label / player.
         by_label: dict = {}
         by_player: dict = {}

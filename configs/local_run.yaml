@@ -17,6 +17,8 @@ action:
   pose_weights: weights/yolo26n-pose.pt
   pose_device: cpu
   rnn_weights: weights/tennis_rnn.h5
+  min_confidence: 0.75       # relaxed (was 0.9) so RNN emits more strokes
+                             # for the rally post-filter to work with
   player: {}
 rally:
   online_min_net_crossings: 3
@@ -24,3 +26,5 @@ rally:
   post_roll_seconds: 1.5
   clip_min_net_crossings: 3
   clip_min_duration_seconds: 2.0
+  parallel_pose: true        # pose worker runs alongside Pass 1a
+  pose_torch_threads: 4      # cap torch's pool so WASB keeps cores
