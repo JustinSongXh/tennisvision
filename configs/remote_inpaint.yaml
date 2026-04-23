@@ -1,0 +1,26 @@
+# Remote test config with InpaintNet trajectory gap-filling enabled.
+# Keeps action (player / pose / stroke) on for the same A/B baseline.
+# Weights staged at /root/personal/, not repo weights/.
+ball:
+  weights: weights/wasb_tennis_best.pth.tar
+  two_stage: false           # skip far-crop WASB pass; one ONNX call per frame
+bounce:
+  weights: weights/bounce_catboost.cbm
+inpainter:
+  enabled: true
+  weights: weights/InpaintNet_best.pt
+  device: cpu
+  window_mode: single        # single-pass (fully-conv model, no seam artifacts)
+  max_gap_frames: 60         # skip gaps longer than this
+  th_h_frac: 0.05            # out-of-view threshold as fraction of frame height
+action:
+  enabled: true
+  pose_weights: /root/personal/yolo26n-pose.pt
+  pose_device:  cpu             # cpu | cuda
+  rnn_weights:  /root/personal/tennis_rnn.h5
+  player: {}
+rally:
+  online_min_net_crossings: 3    # confirm rally on ≥3 net transitions in one burst
+  pre_roll_seconds: 3.0          # 3s lead-in guards against missed serve/toss frames
+  clip_min_net_crossings: 3      # cut video keeps all such rallies
+  clip_min_duration_seconds: 2.0 # and at least 2s long

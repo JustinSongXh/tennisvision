@@ -1,0 +1,12 @@
+# Remote test config: weights staged at /root/personal/, not repo weights/.
+# Used on 192.168.196.196 for tennis_raw2.mp4 action-recognition trial.
+ball:
+  weights: weights/wasb_tennis_best.pth.tar   # repo weights/ (pre-existing)
+bounce:
+  weights: weights/bounce_catboost.cbm        # repo weights/ (pre-existing)
+action:
+  enabled: true
+  pose_weights: /root/personal/yolo26n-pose.pt
+  pose_device:  cuda            # cpu | cuda
+  rnn_weights:  /root/personal/tennis_rnn.h5
+  player: {}

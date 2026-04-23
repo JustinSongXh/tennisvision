@@ -1,0 +1,36 @@
+# Local-run config, mirroring remote_inpaint.yaml but pointing at the
+# in-repo weights directory so paths resolve when cwd is the repo root.
+ball:
+  weights: weights/wasb_tennis_best.pth.tar
+  two_stage: true
+  # Looser detection for near-side fast balls.
+  # Ratios scale with frame size (diag at 1080p = 2202 px).
+  score_threshold: 0.30        # was 0.5 — emit weaker heatmap hits
+  max_disp_ratio: 0.23         # ≈ 506 px @ 1080p (was 300 px)
+tracker:
+  gate_ratio: 0.08             # ≈ 176 px @ 1080p (was 120 px)
+  max_speed_ratio: 0.18        # ≈ 396 px/frame @ 1080p (was 200)
+bounce:
+  weights: weights/bounce_catboost.cbm
+inpainter:
+  enabled: true
+  weights: weights/InpaintNet_best.pt
+  device: cpu
+  window_mode: single
+  max_gap_frames: 60
+  th_h_frac: 0.05
+action:
+  enabled: true
+  pose_weights: weights/yolo26n-pose.pt
+  pose_device: cpu
+  rnn_weights: weights/tennis_rnn.h5
+  min_confidence: 0.80       # relaxed (was 0.9) so the rally post-filter
+                             # has more strokes to work with, but not so low
+                             # that pre-serve toss triggers serve class
+  player: {}
+rally:
+  online_min_net_crossings: 3
+  pre_roll_seconds: 1.5
+  post_roll_seconds: 1.5
+  clip_min_net_crossings: 3
+  clip_min_duration_seconds: 2.0

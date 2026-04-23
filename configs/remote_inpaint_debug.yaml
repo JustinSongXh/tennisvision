@@ -1,0 +1,29 @@
+# Debug config: inpaint on (per-track), action on with LOW confidence
+# threshold + neutral emission so we can see why 'serve' isn't firing.
+# Pass 2 also draws player bboxes and per-event labels.
+ball:
+  weights: weights/wasb_tennis_best.pth.tar
+bounce:
+  weights: weights/bounce_catboost.cbm
+inpainter:
+  enabled: true
+  weights: weights/InpaintNet_best.pt
+  device: cpu
+  window_mode: single
+  max_gap_frames: 60
+  th_h_frac: 0.05
+render:
+  minimap_width_px: 90           # down from 150 so it stops covering the far court
+action:
+  enabled: true
+  pose_weights: /root/personal/yolo26n-pose.pt
+  pose_device:  cuda            # cpu | cuda
+  rnn_weights:  /root/personal/tennis_rnn.h5
+  min_confidence: 0.9
+  emit_neutral:   false
+  stride:         5
+  player:
+    conf:          0.25
+    min_bbox_h:    30
+    max_persons:   6
+    court_margin_m: 5.0
