@@ -131,6 +131,10 @@ DEFAULTS: dict = {
                                                  # but no net crossing for this long
                                                  # (catches pickup / dribble / toss gaps
                                                  # between real rallies); 0 = disabled
+        "online_min_activity_density": 0.30,  # fraction of the burst's frames that must
+                                              # have a ball detection to count as a rally.
+                                              # Real rallies run ~0.5-0.8; spotty warm-up
+                                              # bursts are often < 0.2; 0 = disabled.
         "online_min_net_crossings": 3,     # crossings needed to confirm a rally
         "pre_roll_seconds": 1.0,           # lead-in before first ball motion
         "post_roll_seconds": 1.0,          # kept after last ball motion
