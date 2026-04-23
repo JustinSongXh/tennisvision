@@ -34,5 +34,5 @@ rally:
   post_roll_seconds: 1.5
   clip_min_net_crossings: 3
   clip_min_duration_seconds: 2.0
-  parallel_pose: true        # pose worker runs alongside Pass 1a
-  pose_torch_threads: 4      # cap torch's pool so WASB keeps cores
+  parallel_pose: false       # bounce filter runs first now, pose only
+                             # on rallies that survived — sequential

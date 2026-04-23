@@ -597,6 +597,35 @@ def run(
           (len(events), len(bounces_court)), flush=True)
 
     # ------------------------------------------------------------------
+    # RALLY BOUNCE-FILTER (before Pass 1b so pose only runs on survivors)
+    # ------------------------------------------------------------------
+    if bool(_rcfg.get("require_bounces_both_halves", True)) and rallies:
+        kept: list = []
+        dropped: list = []
+        for r in rallies:
+            near = 0
+            far = 0
+            for (_rx, ry, f) in bounces_court:
+                if r.start_frame <= f <= r.end_frame:
+                    if ry < ref.NET_Y:
+                        near += 1
+                    else:
+                        far += 1
+            if near >= 1 and far >= 1:
+                r.idx = len(kept)
+                kept.append(r)
+            else:
+                dropped.append((r, near, far))
+        if dropped:
+            print("[rally] bounce-filter dropped %d / %d (need bounces in both halves)"
+                  % (len(dropped), len(dropped) + len(kept)), flush=True)
+            for r, near, far in dropped:
+                print("  [%d..%d] crossings=%d bounces=(near=%d,far=%d)"
+                      % (r.start_frame, r.end_frame, r.net_crossings, near, far),
+                      flush=True)
+        rallies = kept
+
+    # ------------------------------------------------------------------
     # PASS 1b — pose + stroke classifier, per detected rally only.
     # We reopen the video and seek to each rally's start, reset the
     # tracker so ByteTrack IDs don't leak across rallies, and feed
@@ -660,47 +689,28 @@ def run(
                 1 for ev in stroke_events
                 if r.start_frame <= ev.frame <= r.end_frame)
 
-        # Dual-signal post-filter: trajectory gives candidates, pose +
-        # bounces confirm they're real.
-        #   reason_strokes — candidate has fewer than post_filter_min_strokes
-        #   reason_bounces — bounces don't span both halves (pre-serve
-        #                    dribbling, pickup, etc.)
+        # Stroke post-filter: the bounce-halves check already ran before
+        # Pass 1b, so here we only need to drop rallies whose pose pass
+        # yielded too few non-neutral strokes (RNN couldn't find real
+        # swings inside a bounce-qualifying window).
         post_min_strokes = int(_rcfg.get("post_filter_min_strokes", 0))
-        need_both_halves = bool(_rcfg.get("require_bounces_both_halves", True))
-
-        if post_min_strokes > 0 or need_both_halves:
+        if post_min_strokes > 0:
             kept: list = []
             dropped: list = []
             for r in rallies:
-                reason: Optional[str] = None
-                near = 0
-                far = 0
-                if need_both_halves:
-                    for (_rx, ry, f) in bounces_court:
-                        if r.start_frame <= f <= r.end_frame:
-                            if ry < ref.NET_Y:
-                                near += 1
-                            else:
-                                far += 1
-                    if near == 0 or far == 0:
-                        reason = ("no bounces (%d near / %d far)"
-                                  % (near, far))
-                if reason is None and post_min_strokes > 0 \
-                        and r.n_strokes < post_min_strokes:
-                    reason = "n_strokes=%d<%d" % (r.n_strokes, post_min_strokes)
-                if reason is None:
+                if r.n_strokes >= post_min_strokes:
                     r.idx = len(kept)
                     kept.append(r)
                 else:
-                    dropped.append((r, reason, near, far))
+                    dropped.append(r)
             if dropped:
-                print("[rally] post-filter dropped %d / %d"
-                      % (len(dropped), len(dropped) + len(kept)), flush=True)
-                for r, reason, near, far in dropped:
-                    print("  [%d..%d] crossings=%d n_strokes=%d "
-                          "bounces=(near=%d,far=%d) — %s"
+                print("[rally] stroke-filter dropped %d / %d (n_strokes<%d)"
+                      % (len(dropped), len(dropped) + len(kept),
+                         post_min_strokes), flush=True)
+                for r in dropped:
+                    print("  [%d..%d] crossings=%d n_strokes=%d"
                           % (r.start_frame, r.end_frame, r.net_crossings,
-                             r.n_strokes, near, far, reason), flush=True)
+                             r.n_strokes), flush=True)
             rallies = kept    # frame_to_rally gets rebuilt below
 
         # Summary by label / player.
