@@ -138,6 +138,14 @@ DEFAULTS: dict = {
         # All temporal knobs are in SECONDS; multiplied by fps at runtime.
         "enabled": True,
         "online_silence_seconds": 3.0,     # ball-free gap that ends an activity burst
+        # Lob handling: when the ball was moving UP, or was already in
+        # the far-side airspace without clearly descending, at the
+        # moment detection was lost, stretch `online_silence_seconds`
+        # by this factor.  Covers 2-3s of no-detection while a lob is
+        # airborne / occluded behind the net.  1.0 = disabled.
+        "online_silence_lob_multiplier": 2.0,
+        "online_silence_lob_up_speed_px": 2.0,   # min |vy| (image px/frame) that
+                                                 # counts as "rising"; below is flat
         "online_crossing_silence_seconds": 4.0,  # force-close when ball is still in play
                                                  # but no net crossing for this long
                                                  # (catches pickup / dribble / toss gaps
