@@ -174,14 +174,23 @@ DEFAULTS: dict = {
         # sample_short — the server dribbling before serve — got
         # misclassified as a rally precisely because of this.
         "require_bounces_both_halves": True,
-        # Parallel Pass-1b: kick off a pose worker thread as soon as a
-        # rally is confirmed in Pass 1a, so ball detection (main thread,
-        # WASB on CoreML/CPU) overlaps with pose + RNN inference.
-        # Requires enough CPU cores to avoid contention (8+ recommended).
-        # When enabled, pose_torch_threads caps the worker's torch pool
-        # so the main thread keeps its fair share of cores.
-        "parallel_pose": False,
-        "pose_torch_threads": 4,
+        # Rally-merge pass: if two adjacent rallies sit less than
+        # `merge_gap_seconds` apart AND no bounce falls inside the gap,
+        # merge them — a mid-rally tracking drop-out looks identical to
+        # a between-point silence at the detector level, but real
+        # between-point gaps contain pickup/dribble bounces whereas a
+        # ball-airborne-out-of-frame gap doesn't.  0 disables.
+        "merge_gap_seconds": 5.0,
+        # Online mode: ball detection, tracker, rally detector AND
+        # pose + stroke classifier all run together in a single pass,
+        # so per-frame results are available live (for real-time
+        # scoreboards, streaming overlays, etc.).  Rally boundaries in
+        # this mode come entirely from OnlineRallyDetector — bounce-
+        # based filters (require_bounces_both_halves, merge_gap_seconds)
+        # are skipped because bounce detection is a batch post-pass
+        # that can't run per-frame.  Default False keeps the original
+        # two-pass offline pipeline (better rally quality, slower).
+        "online": False,
     },
 }
 

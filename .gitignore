@@ -32,3 +32,6 @@ __pycache__/
 # Editor
 .vscode/
 .idea/
+
+# Claude Code local session state (memory, settings snapshots)
+.claude/

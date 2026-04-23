@@ -19,7 +19,6 @@ from __future__ import annotations
 import os
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -281,16 +280,12 @@ def _run_bounce_detector(tracks: list, cfg: dict) -> list:
 
 
 def _run_pose_for_rally(rally, video_path: str, stroke_rec, frame_states: dict):
-    """Pose + stroke for one rally.
+    """Pose + stroke for one rally window.
 
-    Used by both the sequential Pass-1b loop and (when parallel_pose is
-    enabled) the ThreadPoolExecutor worker.  Returns
-    (events, bboxes_by_frame, frames_done, wall_time_s) so the caller
-    can merge results and print a per-rally summary.
-
-    The caller is responsible for ensuring only one invocation runs at a
-    time against the same stroke_rec — with max_workers=1 the executor
-    already guarantees this, so no explicit lock is needed.
+    Re-opens the video, seeks to rally.start_frame, and feeds each frame
+    through `stroke_rec` with the tracker's ball position pulled from
+    `frame_states` (Pass 1a already populated it).  Returns
+    (events, bboxes_by_frame, frames_done, wall_time_s).
     """
     stroke_rec.reset()
     cap = cv2.VideoCapture(video_path)
@@ -422,29 +417,20 @@ def run(
     frame_idx = 0
 
     # ------------------------------------------------------------------
-    # PASS 1a — ball detection + tracking + online rally detection.
-    # Pose / RNN are DEFERRED to Pass 1b so they only run on confirmed
-    # rally frames.
+    # PASS 1 — ball detection + tracking + online rally detection.
+    # Default (offline): pose is DEFERRED to Pass 1b so it only runs on
+    # confirmed rally frames.  With `rally.online=True`, pose + stroke
+    # classifier are inlined into this single pass so per-frame results
+    # are available as the video is processed (for real-time overlays /
+    # scoreboards); the bounce-based rally filters and rally-merge pass
+    # are skipped in that mode because bounce detection is batch-only.
     # ------------------------------------------------------------------
     _rcfg = cfg.get("rally") or {}
     rally_enabled = bool(_rcfg.get("enabled", True))
-    parallel_pose = bool(_rcfg.get("parallel_pose", False)) and stroke_rec is not None
-    pose_executor: Optional[ThreadPoolExecutor] = None
-    pose_futures: list = []         # list[(rally, Future)]
-    n_submitted_rallies = 0
-    if parallel_pose:
-        # Constrain torch's thread pool so the WASB main thread keeps
-        # cores of its own.  Safe to call before any heavy torch op; once
-        # set, ultralytics and the YOLO predictor pick it up.
-        try:
-            import torch as _torch
-            _torch.set_num_threads(max(1, int(_rcfg.get("pose_torch_threads", 4))))
-        except Exception:
-            pass
-        pose_executor = ThreadPoolExecutor(max_workers=1,
-                                            thread_name_prefix="pose")
-        print("[rally] parallel pose enabled (pose_torch_threads=%d)"
-              % int(_rcfg.get("pose_torch_threads", 4)), flush=True)
+    online_mode = bool(_rcfg.get("online", False)) and stroke_rec is not None
+    if _rcfg.get("online", False) and stroke_rec is None:
+        print("[rally] online=True but no stroke classifier available — "
+              "falling back to offline two-pass flow", flush=True)
 
     net_center = np.array([ref.COURT_WIDTH_M / 2.0, ref.NET_Y, 1.0])
     p_net = calib.H_real_to_img @ net_center
@@ -483,7 +469,11 @@ def run(
                   float(_rcfg.get("post_roll_seconds", 1.0)),
                   net_y_px), flush=True)
 
-    print("[pass 1a] ball+tracker only, %d frames ..." % total, flush=True)
+    pass_label = "pass 1 (online: ball+pose+tracker)" if online_mode \
+        else "pass 1a (ball+tracker only)"
+    print("[%s] %d frames ..." % (pass_label, total), flush=True)
+    if online_mode:
+        stroke_rec.reset()
     t0 = time.time()
     t_last = t0
     while True:
@@ -505,21 +495,6 @@ def run(
 
         if online_det is not None:
             online_det.observe(frame_idx, cand_xys, champion)
-            # Kick off pose worker for any newly-confirmed rally.  We
-            # don't wait for post_roll to elapse here because _close()
-            # already clipped rally.end to current_frame - silence + post_roll,
-            # and silence_thresh >= post_roll in the default config so
-            # frame_states[rally.end] is already populated by Pass-1a.
-            if parallel_pose and len(online_det.rallies) > n_submitted_rallies:
-                for r in online_det.rallies[n_submitted_rallies:]:
-                    pose_futures.append((r, pose_executor.submit(
-                        _run_pose_for_rally, r, video_path,
-                        stroke_rec, frame_states)))
-                    print("  [pose worker] queued rally %d [%d..%d] (%d f)"
-                          % (r.idx + 1, r.start_frame, r.end_frame,
-                             r.end_frame - r.start_frame + 1),
-                          flush=True)
-                n_submitted_rallies = len(online_det.rallies)
 
         fs = _FrameState(n_cands=len(cand_xys), n_tracks=len(tracker.tracks))
         if champion is not None:
@@ -529,6 +504,21 @@ def run(
                 (p.x, p.y, p.frame) for p in champion.pts
                 if frame_idx - p.frame <= tail_len
             ]
+
+        # Online mode: run pose + stroke classifier inline so downstream
+        # consumers can read per-frame stroke events / player bboxes as
+        # the frame lands, without waiting for a batch Pass 1b.
+        if online_mode:
+            ball_xy: Optional[tuple] = None
+            if fs.champion_trail:
+                last_x, last_y, last_f = fs.champion_trail[-1]
+                if frame_idx - last_f <= 5:
+                    ball_xy = (last_x, last_y)
+            stroke_events.extend(
+                stroke_rec.push_frame(frame, frame_idx, ball_xy=ball_xy))
+            fs.player_bboxes = dict(
+                getattr(stroke_rec, "last_detections", {}))
+
         frame_states[frame_idx] = fs
 
         if frame_idx % progress_every == 0:
@@ -536,10 +526,10 @@ def run(
             proc_fps = progress_every / max(now - t_last, 1e-6)
             eta = (total - frame_idx) / max(proc_fps, 1e-6)
             n_rallies = len(online_det.rallies) if online_det is not None else 0
-            print("  [pass 1a] frame %d / %d  %.1f fps  eta %.0fs  "
-                  "(%d retired tracks, %d rallies)"
-                  % (frame_idx, total, proc_fps, eta,
-                     len(retired_tracks), n_rallies),
+            print("  [%s] frame %d / %d  %.1f fps  eta %.0fs  "
+                  "(%d retired tracks, %d rallies, %d strokes)"
+                  % (pass_label, frame_idx, total, proc_fps, eta,
+                     len(retired_tracks), n_rallies, len(stroke_events)),
                   flush=True)
             t_last = now
     cap.release()
@@ -548,22 +538,11 @@ def run(
         rallies = online_det.rallies
     else:
         rallies = []
-    print("[pass 1a] done in %.1fs  (%d validated tracks, %d rallies)" %
-          (time.time() - t0,
+    print("[%s] done in %.1fs  (%d validated tracks, %d rallies, %d strokes)" %
+          (pass_label, time.time() - t0,
            sum(1 for t in retired_tracks.values() if t.validated),
-           len(rallies)),
+           len(rallies), len(stroke_events)),
           flush=True)
-
-    # finalize() may have closed a still-open activity → submit any
-    # trailing rallies to the pose worker before we wait.
-    if parallel_pose and len(rallies) > n_submitted_rallies:
-        for r in rallies[n_submitted_rallies:]:
-            pose_futures.append((r, pose_executor.submit(
-                _run_pose_for_rally, r, video_path, stroke_rec, frame_states)))
-            print("  [pose worker] queued rally %d [%d..%d] (%d f)"
-                  % (r.idx + 1, r.start_frame, r.end_frame,
-                     r.end_frame - r.start_frame + 1), flush=True)
-        n_submitted_rallies = len(rallies)
 
     # Also include tracks still alive after the last frame
     for t in tracker.tracks:
@@ -597,9 +576,34 @@ def run(
           (len(events), len(bounces_court)), flush=True)
 
     # ------------------------------------------------------------------
-    # RALLY BOUNCE-FILTER (before Pass 1b so pose only runs on survivors)
+    # RALLY-MERGE PASS (offline only) — glue back together rallies that
+    # Pass 1a split at a mid-rally ball-tracking drop-out.  Runs before
+    # bounce-filter so merged rallies are the ones evaluated for both-
+    # halves coverage.  Needs bounces (gap without a bounce is the
+    # "same rally" signal), so skipped in online mode.
     # ------------------------------------------------------------------
-    if bool(_rcfg.get("require_bounces_both_halves", True)) and rallies:
+    if not online_mode:
+        merge_gap = float(_rcfg.get("merge_gap_seconds", 0.0))
+        if merge_gap > 0.0 and len(rallies) >= 2:
+            from .rally import merge_close_rallies
+            pre_n = len(rallies)
+            rallies, n_merged = merge_close_rallies(
+                rallies, bounces_court, fps, max_gap_seconds=merge_gap,
+            )
+            if n_merged:
+                print("[rally] merge-filter combined %d pairs (%d -> %d "
+                      "rallies; gap<=%.1fs, no bounce in gap)"
+                      % (n_merged, pre_n, len(rallies), merge_gap),
+                      flush=True)
+
+    # ------------------------------------------------------------------
+    # BOUNCE-FILTER (offline only) — require bounces in both court halves.
+    # Online mode skips this: rally boundaries are committed when the
+    # detector closes them, and bounce detection is a post-pass.
+    # ------------------------------------------------------------------
+    if (not online_mode
+            and bool(_rcfg.get("require_bounces_both_halves", True))
+            and rallies):
         kept: list = []
         dropped: list = []
         for r in rallies:
@@ -626,73 +630,45 @@ def run(
         rallies = kept
 
     # ------------------------------------------------------------------
-    # PASS 1b — pose + stroke classifier, per detected rally only.
-    # We reopen the video and seek to each rally's start, reset the
-    # tracker so ByteTrack IDs don't leak across rallies, and feed
-    # only those frames through pose/RNN.  `ball_xy` is pulled from
-    # frame_states (populated in Pass 1a) so the stroke classifier's
-    # ball-proximity gate still works per-frame.
+    # PASS 1b — pose + stroke classifier, per rally (offline only).
+    # Online mode already produced stroke_events inline during Pass 1.
     # ------------------------------------------------------------------
-    if stroke_rec is not None and rallies:
+    if not online_mode and stroke_rec is not None and rallies:
         t_pass1b = time.time()
         total_rally_frames = 0
-
-        if parallel_pose:
-            # Pose workers have been running alongside Pass-1a; now
-            # drain the queue in submission order and merge results.
-            print("[pass 1b] waiting for %d parallel pose workers ..."
-                  % len(pose_futures), flush=True)
-            pose_executor.shutdown(wait=True)
-            for idx, (r, fut) in enumerate(pose_futures):
-                evs, bboxes, n_done, r_time = fut.result()
-                stroke_events.extend(evs)
-                for fi, bb in bboxes.items():
-                    fs = frame_states.get(fi)
-                    if fs is not None:
-                        fs.player_bboxes = bb
-                total_rally_frames += n_done
-                print("  [pass 1b] rally %d/%d  frames [%d..%d] (%d f)  "
-                      "%.1fs = %.1f fps  crossings=%d  strokes_so_far=%d"
-                      % (r.idx + 1, len(rallies), r.start_frame, r.end_frame,
-                         n_done, r_time, n_done / max(r_time, 1e-6),
-                         r.net_crossings, len(stroke_events)),
-                      flush=True)
-        else:
-            print("[pass 1b] pose + stroke for %d rallies ..." % len(rallies),
+        print("[pass 1b] pose + stroke for %d rallies ..." % len(rallies),
+              flush=True)
+        for r in rallies:
+            evs, bboxes, n_done, r_time = _run_pose_for_rally(
+                r, video_path, stroke_rec, frame_states)
+            stroke_events.extend(evs)
+            for fi, bb in bboxes.items():
+                fs = frame_states.get(fi)
+                if fs is not None:
+                    fs.player_bboxes = bb
+            total_rally_frames += n_done
+            print("  [pass 1b] rally %d/%d  frames [%d..%d] (%d f)  "
+                  "%.1fs = %.1f fps  crossings=%d  strokes_so_far=%d"
+                  % (r.idx + 1, len(rallies), r.start_frame, r.end_frame,
+                     n_done, r_time, n_done / max(r_time, 1e-6),
+                     r.net_crossings, len(stroke_events)),
                   flush=True)
-            for r in rallies:
-                evs, bboxes, n_done, r_time = _run_pose_for_rally(
-                    r, video_path, stroke_rec, frame_states)
-                stroke_events.extend(evs)
-                for fi, bb in bboxes.items():
-                    fs = frame_states.get(fi)
-                    if fs is not None:
-                        fs.player_bboxes = bb
-                total_rally_frames += n_done
-                print("  [pass 1b] rally %d/%d  frames [%d..%d] (%d f)  "
-                      "%.1fs = %.1f fps  crossings=%d  strokes_so_far=%d"
-                      % (r.idx + 1, len(rallies), r.start_frame, r.end_frame,
-                         n_done, r_time, n_done / max(r_time, 1e-6),
-                         r.net_crossings, len(stroke_events)),
-                      flush=True)
-
         dt = time.time() - t_pass1b
         print("[pass 1b] done in %.1fs  (%d frames, %.1f fps, %d strokes)"
               % (dt, total_rally_frames,
                  total_rally_frames / max(dt, 1e-6),
                  len(stroke_events)), flush=True)
 
-        # Backfill rally.n_strokes now that Pass 1b is done so the
-        # rallies.json downstream reflects the actual stroke counts.
+    # ------------------------------------------------------------------
+    # Common post-processing (both modes): backfill n_strokes, optional
+    # stroke-count filter, per-label / per-player summary.
+    # ------------------------------------------------------------------
+    if rallies and stroke_events:
         for r in rallies:
             r.n_strokes = sum(
                 1 for ev in stroke_events
                 if r.start_frame <= ev.frame <= r.end_frame)
 
-        # Stroke post-filter: the bounce-halves check already ran before
-        # Pass 1b, so here we only need to drop rallies whose pose pass
-        # yielded too few non-neutral strokes (RNN couldn't find real
-        # swings inside a bounce-qualifying window).
         post_min_strokes = int(_rcfg.get("post_filter_min_strokes", 0))
         if post_min_strokes > 0:
             kept: list = []
@@ -711,9 +687,9 @@ def run(
                     print("  [%d..%d] crossings=%d n_strokes=%d"
                           % (r.start_frame, r.end_frame, r.net_crossings,
                              r.n_strokes), flush=True)
-            rallies = kept    # frame_to_rally gets rebuilt below
+            rallies = kept
 
-        # Summary by label / player.
+    if stroke_events:
         by_label: dict = {}
         by_player: dict = {}
         for ev in stroke_events:
@@ -728,9 +704,6 @@ def run(
         for pid in sorted(by_player.keys()):
             parts = ", ".join("%s=%d" % kv for kv in sorted(by_player[pid].items()))
             print("[action]   player #%d: %s" % (pid, parts), flush=True)
-    elif parallel_pose and pose_executor is not None:
-        # No rallies detected — still need to clean up the idle executor.
-        pose_executor.shutdown(wait=True)
 
     # Build the frame→rally lookup used in Pass 2 for HUD / minimap reset.
     frame_to_rally: list = [-1] * (total + 2)

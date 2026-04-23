@@ -313,6 +313,60 @@ def validate_rallies(
     return kept
 
 
+def merge_close_rallies(
+    rallies: list[Rally],
+    bounces_court: list,
+    fps: float,
+    *,
+    max_gap_seconds: float = 5.0,
+) -> tuple[list[Rally], int]:
+    """Merge adjacent rallies if the gap between them is short AND
+    contains no bounces.
+
+    A mid-rally tracking drop-out (high lob goes out of frame, fast deep
+    ball that WASB misses for a few seconds) produces a gap that looks
+    identical to a between-point gap at the detector level.  The
+    distinguishing signal is physical: real between-point gaps almost
+    always contain pickup / dribbling bounces, whereas a mid-rally
+    silence doesn't — the ball is airborne, out of frame, or simply
+    missed by the detector, and hasn't touched the ground.
+
+    `max_gap_seconds <= 0` disables the pass.
+    """
+    if max_gap_seconds <= 0 or len(rallies) < 2:
+        return list(rallies), 0
+    max_gap_frames = int(round(max_gap_seconds * max(fps, 1.0)))
+    if max_gap_frames <= 0:
+        return list(rallies), 0
+
+    def _clone(r: Rally, idx: int) -> Rally:
+        return Rally(
+            idx=idx, start_frame=r.start_frame, end_frame=r.end_frame,
+            n_events=r.n_events, net_crossings=r.net_crossings,
+            n_strokes=r.n_strokes,
+        )
+
+    out: list[Rally] = [_clone(rallies[0], 0)]
+    n_merged = 0
+    for r in rallies[1:]:
+        prev = out[-1]
+        gap = r.start_frame - prev.end_frame - 1
+        if 0 <= gap <= max_gap_frames:
+            has_bounce_in_gap = any(
+                prev.end_frame < f < r.start_frame
+                for (_x, _y, f) in bounces_court
+            )
+            if not has_bounce_in_gap:
+                prev.end_frame = r.end_frame
+                prev.n_events += r.n_events
+                prev.net_crossings += r.net_crossings
+                prev.n_strokes += r.n_strokes
+                n_merged += 1
+                continue
+        out.append(_clone(r, len(out)))
+    return out, n_merged
+
+
 def select_clip_rallies(
     rallies: list[Rally],
     fps: float,
