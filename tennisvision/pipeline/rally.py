@@ -59,7 +59,9 @@ class OnlineRallyDetector:
                  min_net_crossings: int, pre_roll_frames: int,
                  post_roll_frames: int, total_frames: int,
                  crossing_silence_thresh_frames: int = 0,
-                 min_activity_density: float = 0.0):
+                 min_activity_density: float = 0.0,
+                 lob_silence_multiplier: float = 1.0,
+                 lob_up_speed_px: float = 2.0):
         self.net_y_px = float(net_y_px)
         self.silence_thresh = max(1, int(silence_thresh_frames))
         self.min_crossings = max(1, int(min_net_crossings))
@@ -76,6 +78,14 @@ class OnlineRallyDetector:
         # Spotty coverage (e.g. 12%) usually means the burst spans a
         # warm-up / scrappy exchange with long invisible stretches.
         self.min_activity_density = max(0.0, float(min_activity_density))
+        # Lob handling: when the ball was heading up OR was already in
+        # the far-side airspace at the moment of detection loss, stretch
+        # the silence window by this multiplier.  A lob can stay airborne
+        # 2-3s with no detection (small, far from camera, partially
+        # occluded by net), which under a fixed silence_thresh would
+        # force-close the rally mid-flight.  1.0 disables the stretch.
+        self.lob_silence_multiplier = max(1.0, float(lob_silence_multiplier))
+        self.lob_up_speed_px = max(0.0, float(lob_up_speed_px))
 
         self._activity_start: Optional[int] = None
         self._crossings = 0
@@ -83,6 +93,13 @@ class OnlineRallyDetector:
         self._last_crossing_frame: Optional[int] = None
         self._silent = 0
         self._activity_frames = 0
+        # Last two observed ball-y samples — used to decide whether the
+        # current silence is likely a lob (ball heading up or high when
+        # detection was lost) and the silence window should be stretched.
+        self._last_ball_frame: Optional[int] = None
+        self._last_ball_y: Optional[float] = None
+        self._prev_ball_frame: Optional[int] = None
+        self._prev_ball_y: Optional[float] = None
         self.rallies: list[Rally] = []
 
     # ------------------------------------------------------------------
@@ -113,10 +130,16 @@ class OnlineRallyDetector:
                     self._crossings += 1
                     self._last_crossing_frame = frame_idx
                 self._last_side = side
+                # Record the two most recent ball-y samples for lob
+                # detection at the start of silence.
+                self._prev_ball_frame = self._last_ball_frame
+                self._prev_ball_y = self._last_ball_y
+                self._last_ball_frame = frame_idx
+                self._last_ball_y = ball_y
         else:
             if self._activity_start is not None:
                 self._silent += 1
-                if self._silent >= self.silence_thresh:
+                if self._silent >= self._effective_silence_thresh():
                     self._close_at(frame_idx - self._silent)
                     self._reset()
                     return
@@ -185,6 +208,36 @@ class OnlineRallyDetector:
                 net_crossings=self._crossings,
             ))
 
+    def _effective_silence_thresh(self) -> int:
+        """Silence threshold, stretched by `lob_silence_multiplier` when
+        the last observed ball looked like a lob (heading upward or
+        already above the net line).
+
+        Upward motion is decided from the last two observed y samples —
+        image y decreases toward the top of the frame, so `dy/df < 0`
+        means the ball was rising.  Far-side position alone (y <
+        net_y_px) is a weaker signal on its own (normal over-the-net
+        shots also register there), so we only treat it as a lob
+        indicator when the ball is ALSO not clearly descending.
+        """
+        if self.lob_silence_multiplier <= 1.0:
+            return self.silence_thresh
+        if self._last_ball_y is None:
+            return self.silence_thresh
+        going_up = False
+        nearly_flat = True
+        if (self._prev_ball_y is not None
+                and self._prev_ball_frame is not None
+                and self._last_ball_frame is not None):
+            df = max(1, self._last_ball_frame - self._prev_ball_frame)
+            vy = (self._last_ball_y - self._prev_ball_y) / df
+            going_up = vy <= -self.lob_up_speed_px
+            nearly_flat = abs(vy) < self.lob_up_speed_px
+        was_high = self._last_ball_y < self.net_y_px
+        if going_up or (was_high and nearly_flat):
+            return int(round(self.silence_thresh * self.lob_silence_multiplier))
+        return self.silence_thresh
+
     def _reset(self) -> None:
         self._activity_start = None
         self._crossings = 0
@@ -192,6 +245,10 @@ class OnlineRallyDetector:
         self._last_crossing_frame = None
         self._silent = 0
         self._activity_frames = 0
+        self._last_ball_frame = None
+        self._last_ball_y = None
+        self._prev_ball_frame = None
+        self._prev_ball_y = None
 
 
 def detect_rallies(

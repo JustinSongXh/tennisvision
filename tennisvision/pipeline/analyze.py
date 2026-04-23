@@ -454,14 +454,19 @@ def run(
             min_net_crossings=int(_rcfg.get("online_min_net_crossings", 3)),
             min_activity_density=float(
                 _rcfg.get("online_min_activity_density", 0.0)),
+            lob_silence_multiplier=float(
+                _rcfg.get("online_silence_lob_multiplier", 1.0)),
+            lob_up_speed_px=float(
+                _rcfg.get("online_silence_lob_up_speed_px", 2.0)),
             pre_roll_frames=pre_roll_frames,
             post_roll_frames=post_roll_frames,
             total_frames=total,
         )
-        print("[rally] online detector: silence=%.1fs  crossing_silence=%.1fs  "
-              "min_crossings=%d  min_density=%.2f  "
+        print("[rally] online detector: silence=%.1fs (lob x%.1f)  "
+              "crossing_silence=%.1fs  min_crossings=%d  min_density=%.2f  "
               "pre/post_roll=%.1fs/%.1fs  net_y_px=%.0f" % (
                   float(_rcfg.get("online_silence_seconds", 3.0)),
+                  float(_rcfg.get("online_silence_lob_multiplier", 1.0)),
                   float(_rcfg.get("online_crossing_silence_seconds", 0.0)),
                   int(_rcfg.get("online_min_net_crossings", 3)),
                   float(_rcfg.get("online_min_activity_density", 0.0)),
