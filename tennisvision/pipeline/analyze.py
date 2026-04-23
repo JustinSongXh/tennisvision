@@ -340,8 +340,59 @@ def run(
     *,
     progress_every: int = 100,
 ) -> AnalyzeResult:
-    ball_det, ball_detect_fn = _build_ball_detector(cfg["ball"], calib=calib)
-    tcfg = cfg["tracker"]
+    # Peek at frame dimensions so *_ratio config keys can be resolved to
+    # pixels before any detector or tracker is built.  Ratios scale with
+    # frame resolution — same config file works on 720p / 1080p / 4K.
+    _cap_peek = cv2.VideoCapture(video_path)
+    if not _cap_peek.isOpened():
+        raise SystemExit("cannot open " + video_path)
+    W = int(_cap_peek.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(_cap_peek.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = _cap_peek.get(cv2.CAP_PROP_FPS)
+    total = int(_cap_peek.get(cv2.CAP_PROP_FRAME_COUNT))
+    _cap_peek.release()
+    frame_diag = float((W * W + H * H) ** 0.5)
+
+    def _resolve_ratio(d: dict, ratio_key: str, pixel_key: str, basis: float):
+        """Return the pixel value for `pixel_key`, preferring a ratio-based
+        key (multiplied by `basis`) if it's set, otherwise the pixel key."""
+        if ratio_key in d and d[ratio_key] is not None:
+            return float(d[ratio_key]) * basis
+        return d.get(pixel_key)
+
+    # Ball + tracker config: resolve ratios → pixels so downstream
+    # classes stay pixel-based (no API churn).
+    bcfg = dict(cfg["ball"])
+    v = _resolve_ratio(bcfg, "max_disp_ratio", "max_disp", frame_diag)
+    if v is not None:
+        bcfg["max_disp"] = v
+    v = _resolve_ratio(bcfg, "two_stage_dedup_ratio", "two_stage_dedup_px", frame_diag)
+    if v is not None:
+        bcfg["two_stage_dedup_px"] = v
+    v = _resolve_ratio(bcfg, "court_mask_margin_ratio", "court_mask_margin_px", float(W))
+    if v is not None:
+        bcfg["court_mask_margin_px"] = v
+
+    tcfg = dict(cfg["tracker"])
+    v = _resolve_ratio(tcfg, "gate_ratio", "gate_px", frame_diag)
+    if v is not None:
+        tcfg["gate_px"] = v
+    v = _resolve_ratio(tcfg, "min_speed_ratio", "min_speed", frame_diag)
+    if v is not None:
+        tcfg["min_speed"] = v
+    v = _resolve_ratio(tcfg, "max_speed_ratio", "max_speed", frame_diag)
+    if v is not None:
+        tcfg["max_speed"] = v
+
+    print("[video] %dx%d (diag=%.0f px)  fps=%.2f  total=%d" %
+          (W, H, frame_diag, fps, total), flush=True)
+    print("[config] resolved ball.max_disp=%.0f  ball.two_stage_dedup_px=%.0f  "
+          "tracker.gate_px=%.0f  min_speed=%.1f  max_speed=%.1f"
+          % (bcfg.get("max_disp", 0.0), bcfg.get("two_stage_dedup_px", 0.0),
+             tcfg.get("gate_px", 0.0), tcfg.get("min_speed", 0.0),
+             tcfg.get("max_speed", 0.0)), flush=True)
+
+    ball_det, ball_detect_fn = _build_ball_detector(bcfg, calib=calib)
     tracker = MultiTrackManager(TrackerConfig(
         gate_px=tcfg["gate_px"], max_gap_frames=tcfg["max_gap_frames"],
         min_len=tcfg["min_len"], min_speed=tcfg["min_speed"],
@@ -368,18 +419,12 @@ def run(
     # PASS 1 — tracking only; remember per-frame state + retired tracks
     # ------------------------------------------------------------------
     cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise SystemExit("cannot open " + video_path)
-    fps   = cap.get(cv2.CAP_PROP_FPS)
-    W     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     # Precompute horizontal court strip mask to reject adjacent-court balls.
     # Only left/right sidelines are enforced; vertical extent is unconstrained
     # so balls that fly high or arc above the baseline are still captured.
     _court_mask: Optional[np.ndarray] = None
-    _court_mask_margin = cfg.get("ball", {}).get("court_mask_margin_px", 30)
+    _court_mask_margin = bcfg.get("court_mask_margin_px", 30)
     if _court_mask_margin > 0:
         _court_mask = calib.court_h_strip_mask(W, H, margin_px=_court_mask_margin)
 

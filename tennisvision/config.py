@@ -25,10 +25,17 @@ DEFAULTS: dict = {
         "runtime": "auto",
         "onnx_path": None,
         "score_threshold": 0.5,
+        # Distance / margin thresholds accept either a pixel value OR a
+        # ratio (of the frame diagonal, except court_mask_margin_ratio
+        # which is of frame WIDTH).  Ratio takes precedence when set.
+        # Ratios make the config portable across 720p / 1080p / 4K.
         "max_disp": 300.0,
+        "max_disp_ratio": None,
         "two_stage": True,             # run a second WASB pass on a far-court crop
                                        # (needs calib); off → single full-frame pass
         "two_stage_dedup_px": 60.0,    # merge main + far candidates within this distance
+        "two_stage_dedup_ratio": None,
+        "court_mask_margin_ratio": None,
         "hsv_low":  [25, 60, 120],
         "hsv_high": [50, 255, 255],
         "min_area": 3,
@@ -57,11 +64,17 @@ DEFAULTS: dict = {
         "th_h_frac": 0.05,                   # out-of-view y-threshold as fraction of H
     },
     "tracker": {
+        # All pixel thresholds accept an equivalent *_ratio (of frame
+        # diagonal) that overrides the pixel value at runtime.  Speed
+        # ratios are interpreted as "fraction of diagonal per frame".
         "gate_px": 120,
+        "gate_ratio": None,
         "max_gap_frames": 8,
         "min_len": 3,
         "min_speed": 5.0,
+        "min_speed_ratio": None,
         "max_speed": 200.0,
+        "max_speed_ratio": None,
         "render_tail": 45,
     },
     "bounce": {

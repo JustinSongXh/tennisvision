@@ -3,6 +3,13 @@
 ball:
   weights: weights/wasb_tennis_best.pth.tar
   two_stage: true
+  # Looser detection for near-side fast balls.
+  # Ratios scale with frame size (diag at 1080p = 2202 px).
+  score_threshold: 0.30        # was 0.5 — emit weaker heatmap hits
+  max_disp_ratio: 0.23         # ≈ 506 px @ 1080p (was 300 px)
+tracker:
+  gate_ratio: 0.08             # ≈ 176 px @ 1080p (was 120 px)
+  max_speed_ratio: 0.18        # ≈ 396 px/frame @ 1080p (was 200)
 bounce:
   weights: weights/bounce_catboost.cbm
 inpainter:
