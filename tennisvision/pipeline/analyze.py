@@ -636,7 +636,7 @@ def run(
 
         # Pose post-filter: trajectory gives us rally candidates, pose
         # confirms they're real (warm-up / pickup yield few strokes).
-        post_min = int(rcfg_rally.get("post_filter_min_strokes", 0))
+        post_min = int(_rcfg.get("post_filter_min_strokes", 0))
         if post_min > 0:
             dropped: list = []
             kept: list = []
