@@ -136,6 +136,52 @@ def _postprocess_heatmap(heatmap: np.ndarray, low_thresh: int = 170,
     return float(circles[0][0][0]), float(circles[0][0][1])
 
 
+class ResNet50CourtDetector:
+    """abdullahtarek-style ResNet50 regression court keypoint detector.
+
+    Outputs all 14 keypoints unconditionally (regression, not heatmap).
+    Weights: https://drive.google.com/file/d/1QrTOF1ToQ4plsSZbkBs3zOLkVt3MBlta
+    Expected location: weights/court_resnet.pth (or pass weights= argument).
+
+    Output keypoint ordering follows UPSTREAM_TO_OURS (same dataset as TCD).
+    """
+
+    def __init__(self, weights: str = "weights/court_resnet.pth",
+                 device: str = "cpu"):
+        if not _HAS_TORCH:
+            raise RuntimeError("PyTorch is required for ResNet50CourtDetector.")
+        from torchvision import models, transforms
+        self.device = torch.device(device)
+        self.transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225]),
+        ])
+        import cv2 as _cv2
+        self._cv2 = _cv2
+        model = models.resnet50(weights=None)
+        model.fc = torch.nn.Linear(model.fc.in_features, 14 * 2)
+        state = torch.load(weights, map_location=self.device)
+        model.load_state_dict(state)
+        model.to(self.device)
+        model.eval()
+        self.model = model
+
+    def detect(self, frame: np.ndarray) -> dict[int, tuple[float, float]]:
+        """Return dict[our_keypoint_id -> (x_px, y_px)] in original image coords."""
+        H, W = frame.shape[:2]
+        rgb = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
+        x = self.transform(rgb).unsqueeze(0).to(self.device)
+        with torch.inference_mode():
+            raw = self.model(x).squeeze().cpu().numpy()
+        raw[::2]  *= W / 224.0
+        raw[1::2] *= H / 224.0
+        return {UPSTREAM_TO_OURS[i]: (float(raw[2 * i]), float(raw[2 * i + 1]))
+                for i in range(14)}
+
+
 class HeatmapDetector:
     """Run yastrebksv/TennisCourtDetector on a single frame.
 
