@@ -155,6 +155,14 @@ DEFAULTS: dict = {
         # with the trajectory-based filters (crossings + density) as a
         # second sanity gate.  0 disables.
         "post_filter_min_strokes": 2,
+        # Bounce-split validation: require the rally's bounces to span
+        # both court halves.  Bounces sit on z=0 (the ground plane) so
+        # their homography projection to court-y is accurate, unlike
+        # airborne ball trajectory which can't tell a high pre-serve
+        # toss apart from a real over-the-net shot.  Rally 0 of
+        # sample_short — the server dribbling before serve — got
+        # misclassified as a rally precisely because of this.
+        "require_bounces_both_halves": True,
         # Parallel Pass-1b: kick off a pose worker thread as soon as a
         # rally is confirmed in Pass 1a, so ball detection (main thread,
         # WASB on CoreML/CPU) overlaps with pose + RNN inference.

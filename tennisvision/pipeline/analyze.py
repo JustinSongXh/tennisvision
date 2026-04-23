@@ -634,26 +634,47 @@ def run(
                 1 for ev in stroke_events
                 if r.start_frame <= ev.frame <= r.end_frame)
 
-        # Pose post-filter: trajectory gives us rally candidates, pose
-        # confirms they're real (warm-up / pickup yield few strokes).
-        post_min = int(_rcfg.get("post_filter_min_strokes", 0))
-        if post_min > 0:
-            dropped: list = []
+        # Dual-signal post-filter: trajectory gives candidates, pose +
+        # bounces confirm they're real.
+        #   reason_strokes — candidate has fewer than post_filter_min_strokes
+        #   reason_bounces — bounces don't span both halves (pre-serve
+        #                    dribbling, pickup, etc.)
+        post_min_strokes = int(_rcfg.get("post_filter_min_strokes", 0))
+        need_both_halves = bool(_rcfg.get("require_bounces_both_halves", True))
+
+        if post_min_strokes > 0 or need_both_halves:
             kept: list = []
+            dropped: list = []
             for r in rallies:
-                if r.n_strokes >= post_min:
+                reason: Optional[str] = None
+                near = 0
+                far = 0
+                if need_both_halves:
+                    for (_rx, ry, f) in bounces_court:
+                        if r.start_frame <= f <= r.end_frame:
+                            if ry < ref.NET_Y:
+                                near += 1
+                            else:
+                                far += 1
+                    if near == 0 or far == 0:
+                        reason = ("no bounces (%d near / %d far)"
+                                  % (near, far))
+                if reason is None and post_min_strokes > 0 \
+                        and r.n_strokes < post_min_strokes:
+                    reason = "n_strokes=%d<%d" % (r.n_strokes, post_min_strokes)
+                if reason is None:
                     r.idx = len(kept)
                     kept.append(r)
                 else:
-                    dropped.append(r)
+                    dropped.append((r, reason, near, far))
             if dropped:
-                print("[rally] post-filter: %d rallies dropped for n_strokes<%d "
-                      "(kept %d)" % (len(dropped), post_min, len(kept)),
-                      flush=True)
-                for r in dropped:
-                    print("  dropped rally [%d..%d] crossings=%d n_strokes=%d"
+                print("[rally] post-filter dropped %d / %d"
+                      % (len(dropped), len(dropped) + len(kept)), flush=True)
+                for r, reason, near, far in dropped:
+                    print("  [%d..%d] crossings=%d n_strokes=%d "
+                          "bounces=(near=%d,far=%d) — %s"
                           % (r.start_frame, r.end_frame, r.net_crossings,
-                             r.n_strokes), flush=True)
+                             r.n_strokes, near, far, reason), flush=True)
             rallies = kept    # frame_to_rally gets rebuilt below
 
         # Summary by label / player.

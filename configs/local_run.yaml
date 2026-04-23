@@ -17,8 +17,9 @@ action:
   pose_weights: weights/yolo26n-pose.pt
   pose_device: cpu
   rnn_weights: weights/tennis_rnn.h5
-  min_confidence: 0.75       # relaxed (was 0.9) so RNN emits more strokes
-                             # for the rally post-filter to work with
+  min_confidence: 0.80       # relaxed (was 0.9) so the rally post-filter
+                             # has more strokes to work with, but not so low
+                             # that pre-serve toss triggers serve class
   player: {}
 rally:
   online_min_net_crossings: 3
