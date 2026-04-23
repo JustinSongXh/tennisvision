@@ -369,10 +369,6 @@ def run(
     v = _resolve_ratio(bcfg, "two_stage_dedup_ratio", "two_stage_dedup_px", frame_diag)
     if v is not None:
         bcfg["two_stage_dedup_px"] = v
-    v = _resolve_ratio(bcfg, "court_mask_margin_ratio", "court_mask_margin_px", float(W))
-    if v is not None:
-        bcfg["court_mask_margin_px"] = v
-
     tcfg = dict(cfg["tracker"])
     v = _resolve_ratio(tcfg, "gate_ratio", "gate_px", frame_diag)
     if v is not None:
@@ -386,11 +382,11 @@ def run(
 
     print("[video] %dx%d (diag=%.0f px)  fps=%.2f  total=%d" %
           (W, H, frame_diag, fps, total), flush=True)
-    print("[config] resolved ball.max_disp=%.0f  ball.two_stage_dedup_px=%.0f  "
-          "tracker.gate_px=%.0f  min_speed=%.1f  max_speed=%.1f"
-          % (bcfg.get("max_disp", 0.0), bcfg.get("two_stage_dedup_px", 0.0),
-             tcfg.get("gate_px", 0.0), tcfg.get("min_speed", 0.0),
-             tcfg.get("max_speed", 0.0)), flush=True)
+    print("[config] resolved ball.max_disp=%.0f  tracker.gate_px=%.0f  "
+          "min_speed=%.1f  max_speed=%.1f"
+          % (bcfg.get("max_disp", 0.0), tcfg.get("gate_px", 0.0),
+             tcfg.get("min_speed", 0.0), tcfg.get("max_speed", 0.0)),
+          flush=True)
 
     ball_det, ball_detect_fn = _build_ball_detector(bcfg, calib=calib)
     tracker = MultiTrackManager(TrackerConfig(
@@ -419,21 +415,6 @@ def run(
     # PASS 1 — tracking only; remember per-frame state + retired tracks
     # ------------------------------------------------------------------
     cap = cv2.VideoCapture(video_path)
-
-    # Precompute horizontal court strip mask to reject adjacent-court balls.
-    # Only left/right sidelines are enforced; vertical extent is unconstrained
-    # so balls that fly high or arc above the baseline are still captured.
-    _court_mask: Optional[np.ndarray] = None
-    _court_mask_margin = bcfg.get("court_mask_margin_px", 30)
-    if _court_mask_margin > 0:
-        _court_mask = calib.court_h_strip_mask(W, H, margin_px=_court_mask_margin)
-
-    def _filter_cands(cands: list) -> list:
-        if _court_mask is None:
-            return cands
-        return [(x, y) for x, y in cands
-                if 0 <= int(y) < H and 0 <= int(x) < W
-                and _court_mask[int(y), int(x)] > 0]
 
     frame_states: dict[int, _FrameState] = {}
     retired_tracks: dict[int, Track] = {}     # by track.id
@@ -513,7 +494,7 @@ def run(
 
         before_ids = {t.id: t for t in tracker.tracks}
 
-        cand_xys = _filter_cands(ball_detect_fn(frame))
+        cand_xys = ball_detect_fn(frame)
         tracker.update(cand_xys, frame_idx)
         champion = tracker.champion(frame_idx)
 

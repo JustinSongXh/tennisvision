@@ -26,16 +26,14 @@ DEFAULTS: dict = {
         "onnx_path": None,
         "score_threshold": 0.5,
         # Distance / margin thresholds accept either a pixel value OR a
-        # ratio (of the frame diagonal, except court_mask_margin_ratio
-        # which is of frame WIDTH).  Ratio takes precedence when set.
-        # Ratios make the config portable across 720p / 1080p / 4K.
+        # ratio (of the frame diagonal).  Ratio takes precedence when
+        # set.  Ratios make the config portable across 720p / 1080p / 4K.
         "max_disp": 300.0,
         "max_disp_ratio": None,
         "two_stage": True,             # run a second WASB pass on a far-court crop
                                        # (needs calib); off → single full-frame pass
         "two_stage_dedup_px": 60.0,    # merge main + far candidates within this distance
         "two_stage_dedup_ratio": None,
-        "court_mask_margin_ratio": None,
         "hsv_low":  [25, 60, 120],
         "hsv_high": [50, 255, 255],
         "min_area": 3,
