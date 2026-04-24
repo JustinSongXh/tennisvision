@@ -44,18 +44,6 @@ DEFAULTS: dict = {
         "player_max_area": 60000,
         "player_max_w_frac": 0.55,
         "player_max_h_frac": 0.75,
-        # Adjacent-court filter (track-level).  After Pass 1a forms
-        # validated tracks, drop any track whose fraction of points
-        # inside the inflated court polygon falls below
-        # `on_court_min_inside_fraction`.  The polygon is built by
-        # projecting the 4 court corners (inflated by `on_court_margin_m`
-        # court-meters) through H_real_to_img, so perspective is baked
-        # in and airborne balls above the court project INSIDE.
-        # Track-level (not per-candidate) so a single near-sideline
-        # point can't kill tracker continuity on legit shots.
-        # `on_court_margin_m` <= 0 disables the filter.
-        "on_court_margin_m": 4.0,
-        "on_court_min_inside_fraction": 0.6,
     },
     "inpainter": {
         # TrackNetV3 InpaintNet: learned gap-filler run on the union of

@@ -384,37 +384,6 @@ def run(
           flush=True)
 
     ball_det, ball_detect_fn = _build_ball_detector(bcfg, calib=calib)
-
-    # Adjacent-court filter (track-level): built here so Pass 1a can
-    # record the polygon once and Pass-1a-post can apply it to every
-    # validated track.  A single stray candidate inside the polygon is
-    # allowed through to the tracker — only whole tracks that sit
-    # predominantly outside (fraction-inside < min_inside_fraction) get
-    # dropped after tracks retire.  This is looser than a per-candidate
-    # gate so near-sideline serves don't lose tracker continuity, but
-    # still strips adjacent-court tracks that WASB grabs from the
-    # neighboring court.
-    on_court_margin_m = float(bcfg.get("on_court_margin_m", 0.0))
-    on_court_min_inside = float(bcfg.get("on_court_min_inside_fraction", 0.0))
-    on_court_poly: Optional[np.ndarray] = None
-    if on_court_margin_m > 0.0 and calib is not None:
-        try:
-            on_court_poly = calib.on_court_polygon_img(on_court_margin_m)
-            if not np.all(np.isfinite(on_court_poly)):
-                print("[ball] on-court polygon has non-finite corners; "
-                      "disabling adjacent-court filter", flush=True)
-                on_court_poly = None
-        except Exception as e:                      # noqa: BLE001
-            print("[ball] on_court_polygon_img failed (%s); disabling "
-                  "adjacent-court filter" % e, flush=True)
-            on_court_poly = None
-    if on_court_poly is not None:
-        print("[ball] adjacent-court filter on (margin=%.1fm, "
-              "min_inside=%.2f, polygon=%s)"
-              % (on_court_margin_m, on_court_min_inside,
-                 " ".join("(%.0f,%.0f)" % (x, y) for x, y in on_court_poly)),
-              flush=True)
-
     tracker = MultiTrackManager(TrackerConfig(
         gate_px=tcfg["gate_px"], max_gap_frames=tcfg["max_gap_frames"],
         min_len=tcfg["min_len"], min_speed=tcfg["min_speed"],
@@ -625,49 +594,6 @@ def run(
         if t.validated:
             retired_tracks.setdefault(t.id, t)
     all_tracks = list(retired_tracks.values())
-
-    # ------------------------------------------------------------------
-    # ADJACENT-COURT FILTER (track-level) — drop tracks whose fraction
-    # of points inside the inflated court polygon falls below
-    # `ball.on_court_min_inside_fraction`.  Runs before inpainting /
-    # bounce detection so adjacent-court tracks never contribute to
-    # either, but leaves `frame_states` untouched: Pass 2 trail render
-    # still uses the unfiltered tracker champion, so the filter can
-    # never erase a legitimate trail from the output video — only
-    # downstream artefacts (bounces, rally bounce-filter) see the
-    # narrowed track set.  Perspective stretch makes the 4m-margin
-    # polygon's near edge balloon off-screen, and the scrub-champion
-    # version of this filter was erasing too many legitimate trails
-    # when any single near-sideline track happened to sit mostly
-    # outside the polygon.
-    # ------------------------------------------------------------------
-    if (on_court_poly is not None and all_tracks
-            and on_court_min_inside > 0.0):
-        kept_tracks: list = []
-        dropped_ids: list = []
-        for t in all_tracks:
-            n_pts = len(t.pts)
-            if n_pts == 0:
-                continue
-            n_inside = sum(
-                1 for p in t.pts
-                if cv2.pointPolygonTest(
-                    on_court_poly, (float(p.x), float(p.y)), False) >= 0)
-            frac = n_inside / n_pts
-            if frac >= on_court_min_inside:
-                kept_tracks.append(t)
-            else:
-                dropped_ids.append((t.id, n_pts, frac))
-        if dropped_ids:
-            print("[ball] adjacent-court filter dropped %d / %d tracks "
-                  "for downstream (bounce/rally); render trails "
-                  "untouched (min_inside=%.2f)"
-                  % (len(dropped_ids), len(all_tracks), on_court_min_inside),
-                  flush=True)
-            for tid, npts, frac in dropped_ids[:10]:
-                print("  [drop] track %d  n_pts=%d  inside=%.2f"
-                      % (tid, npts, frac), flush=True)
-        all_tracks = kept_tracks
 
     # ------------------------------------------------------------------
     # TRAJECTORY INPAINTING (optional; V2)
