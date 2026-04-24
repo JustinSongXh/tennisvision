@@ -9,6 +9,7 @@ from typing import Optional
 
 import numpy as np
 
+from . import reference as ref
 from .homography import HomographyResult
 
 
@@ -56,6 +57,32 @@ class Calibration:
             source=source,
             reprojection_error_m=hr.reprojection_error_m,
         )
+
+    def on_court_polygon_img(self, margin_m: float = 0.0) -> np.ndarray:
+        """Image-space quadrilateral covering the court plus `margin_m`
+        of court-meter padding outside every side.
+
+        Built by projecting 4 real-world corners through H_real_to_img,
+        so perspective is baked in.  Airborne balls above the court
+        still project INSIDE this polygon (they're above court ground,
+        not above an adjacent court), so this is resilient to the z=0
+        projection error that makes court-coord X-gates unreliable for
+        high balls.
+
+        Returns a (4, 2) float32 array of image pixels in the order
+        near-left, near-right, far-right, far-left (CCW in court space).
+        """
+        m = float(margin_m)
+        corners_real = np.array([
+            [-m,                        -m,                         1.0],
+            [ref.COURT_WIDTH_M + m,     -m,                         1.0],
+            [ref.COURT_WIDTH_M + m,     ref.COURT_LENGTH_M + m,     1.0],
+            [-m,                        ref.COURT_LENGTH_M + m,     1.0],
+        ], dtype=np.float64)
+        H = self.H_real_to_img
+        corners_img = (H @ corners_real.T).T           # (4, 3)
+        corners_img = corners_img[:, :2] / corners_img[:, 2:3]
+        return corners_img.astype(np.float32)
 
 
 def save(calib: Calibration, path: str) -> None:
