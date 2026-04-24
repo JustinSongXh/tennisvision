@@ -63,6 +63,8 @@ class OnlineRallyDetector:
                  min_activity_density: float = 0.0,
                  lob_silence_multiplier: float = 1.0,
                  lob_up_speed_px: float = 2.0,
+                 discontinuity_jump_px: float = 0.0,
+                 discontinuity_no_cross_frames: int = 30,
                  serve_enabled: bool = False,
                  serve_toss_rise_px_near: float = 132.0,
                  serve_toss_rise_px_far: float = 33.0,
@@ -101,6 +103,14 @@ class OnlineRallyDetector:
         # force-close the rally mid-flight.  1.0 disables the stretch.
         self.lob_silence_multiplier = max(1.0, float(lob_silence_multiplier))
         self.lob_up_speed_px = max(0.0, float(lob_up_speed_px))
+        # Discontinuity-close gate: force-close a burst when the ball
+        # appears to teleport (jump + direction flip) in a stretch
+        # without recent net crossings — signals a between-point ball
+        # pickup & re-toss that bounce / crossing-silence counters
+        # otherwise miss.  See config.py for full rationale.
+        self.discontinuity_jump_px = max(0.0, float(discontinuity_jump_px))
+        self.discontinuity_no_cross_frames = max(
+            0, int(discontinuity_no_cross_frames))
         # Serve detection: a confirmed toss pattern
         #   hold → rise → apex → descent, near a baseline, mostly vertical
         # is a SOFT signal that a new point is starting.  To avoid the
@@ -151,9 +161,12 @@ class OnlineRallyDetector:
         # current silence is likely a lob (ball heading up or high when
         # detection was lost) and the silence window should be stretched.
         self._last_ball_frame: Optional[int] = None
+        self._last_ball_x: Optional[float] = None
         self._last_ball_y: Optional[float] = None
         self._prev_ball_frame: Optional[int] = None
+        self._prev_ball_x: Optional[float] = None
         self._prev_ball_y: Optional[float] = None
+        self._discontinuity_closes = 0
         # Ball (frame, x, y) ring buffer for serve toss detection.
         self._ball_hist: Deque[tuple[int, float, float]] = deque()
         self._last_serve_frame: Optional[int] = None
@@ -224,6 +237,46 @@ class OnlineRallyDetector:
                     self._last_side = None
                     self._last_crossing_frame = toss_start
 
+            # Discontinuity close: the ball just teleported (big jump)
+            # AND direction flipped AND we are in a quiet stretch
+            # since the last net crossing.  In a real rally, bounces
+            # and strokes are tracker-continuous (jump per frame
+            # stays under ~80 px), and lobs flip direction but also
+            # stay continuous — so only a between-point ball pickup
+            # / re-toss, where the ball appears at a new position
+            # in the image, produces large-jump + direction-flip.
+            # Gate additionally on the gap since last observation so
+            # long detector-gap re-acquisitions (handled elsewhere
+            # by silence thresholds) do not mis-fire.
+            if (self._activity_start is not None
+                    and self.discontinuity_jump_px > 0
+                    and ball_x is not None and ball_y is not None
+                    and self._last_ball_frame is not None
+                    and self._last_ball_x is not None
+                    and self._prev_ball_x is not None
+                    and self._last_ball_y is not None
+                    and self._prev_ball_y is not None):
+                gap = frame_idx - self._last_ball_frame
+                if 1 <= gap <= 10:
+                    dx_new = ball_x - self._last_ball_x
+                    dy_new = ball_y - self._last_ball_y
+                    jump = (dx_new * dx_new + dy_new * dy_new) ** 0.5
+                    dx_old = self._last_ball_x - self._prev_ball_x
+                    dy_old = self._last_ball_y - self._prev_ball_y
+                    dot = dx_new * dx_old + dy_new * dy_old
+                    time_since_cross = (
+                        frame_idx - self._last_crossing_frame
+                        if self._last_crossing_frame is not None
+                        else 10 ** 9)
+                    if (jump > self.discontinuity_jump_px
+                            and dot < 0
+                            and time_since_cross
+                                >= self.discontinuity_no_cross_frames):
+                        self._discontinuity_closes += 1
+                        self._close_at(self._last_ball_frame)
+                        self._reset()
+                        return
+
             if self._activity_start is None:
                 self._activity_start = frame_idx
                 self._crossings = 0
@@ -239,12 +292,16 @@ class OnlineRallyDetector:
                     self._crossings += 1
                     self._last_crossing_frame = frame_idx
                 self._last_side = side
-                # Record the two most recent ball-y samples for lob
-                # detection at the start of silence.
+                # Record the two most recent ball (x, y) samples — y
+                # for lob detection at the start of silence, x for
+                # the discontinuity gate above.
                 self._prev_ball_frame = self._last_ball_frame
                 self._prev_ball_y = self._last_ball_y
+                self._prev_ball_x = self._last_ball_x
                 self._last_ball_frame = frame_idx
                 self._last_ball_y = ball_y
+                if ball_x is not None:
+                    self._last_ball_x = ball_x
         else:
             if self._activity_start is not None:
                 self._silent += 1
@@ -483,8 +540,10 @@ class OnlineRallyDetector:
         self._silent = 0
         self._activity_frames = 0
         self._last_ball_frame = None
+        self._last_ball_x = None
         self._last_ball_y = None
         self._prev_ball_frame = None
+        self._prev_ball_x = None
         self._prev_ball_y = None
 
 

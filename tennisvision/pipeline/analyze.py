@@ -462,6 +462,10 @@ def run(
             _rcfg.get("serve_toss_rise_ratio_far", 0.015)) * frame_diag)
         serve_soft_quiet_frames = int(round(
             float(_rcfg.get("serve_soft_quiet_seconds", 1.0)) * max(fps, 1.0)))
+        discont_jump_px = float(_rcfg.get("discontinuity_jump_px", 0.0))
+        discont_no_cross_frames = int(round(
+            float(_rcfg.get("discontinuity_no_cross_seconds", 1.0))
+            * max(fps, 1.0)))
         online_det = OnlineRallyDetector(
             net_y_px=net_y_px,
             silence_thresh_frames=silence_thresh,
@@ -473,6 +477,8 @@ def run(
                 _rcfg.get("online_silence_lob_multiplier", 1.0)),
             lob_up_speed_px=float(
                 _rcfg.get("online_silence_lob_up_speed_px", 2.0)),
+            discontinuity_jump_px=discont_jump_px,
+            discontinuity_no_cross_frames=discont_no_cross_frames,
             serve_enabled=serve_enabled,
             serve_toss_rise_px_near=serve_rise_px_near,
             serve_toss_rise_px_far=serve_rise_px_far,
@@ -502,6 +508,7 @@ def run(
               "crossing_silence=%.1fs  min_crossings=%d  min_density=%.2f  "
               "pre/post_roll=%.1fs/%.1fs  net_y_px=%.0f  "
               "baselines near/far=y%.0f/%.0f  "
+              "discontinuity=%s (jump>%.0fpx, no_cross>=%.1fs)  "
               "serve=%s (rise near/far=%.0f/%.0fpx, min=%df, "
               "horiz<=%.2f, baseline<=%.1fm, pre_static<=%.1fpx, "
               "soft_quiet=%.1fs)" % (
@@ -514,6 +521,9 @@ def run(
                   float(_rcfg.get("post_roll_seconds", 1.0)),
                   net_y_px,
                   near_baseline_y_px, far_baseline_y_px,
+                  "on" if discont_jump_px > 0 else "off",
+                  discont_jump_px,
+                  float(_rcfg.get("discontinuity_no_cross_seconds", 1.0)),
                   "on" if serve_enabled else "off",
                   serve_rise_px_near, serve_rise_px_far,
                   int(_rcfg.get("serve_toss_min_frames", 6)),
@@ -670,6 +680,9 @@ def run(
               "masked champion on %d frames (rally + render)"
               % (rally_filtered_cands, rally_filtered_champions),
               flush=True)
+    if online_det is not None and online_det.discontinuity_jump_px > 0:
+        print("[rally] discontinuity close fired %d times"
+              % online_det._discontinuity_closes, flush=True)
 
     # Also include tracks still alive after the last frame
     for t in tracker.tracks:
