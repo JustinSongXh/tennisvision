@@ -760,6 +760,7 @@ def write_rally_video(
     dst_video: str,
     *,
     separator_seconds: float = 1.0,
+    extra_tail_seconds: float = 0.0,
     fourcc: str = "mp4v",
 ) -> None:
     """Copy each rally's frames from `src_video` to `dst_video`, with a
@@ -768,6 +769,15 @@ def write_rally_video(
     `src_video` should be the already-rendered annotated output — the
     cut video inherits its overlays (trails, bboxes, stroke labels,
     minimap) without re-running analysis.
+
+    `extra_tail_seconds` tacks that many extra frames past each
+    rally's `end_frame` onto the cut video so the trailing bounces
+    /ball-settling after the final stroke stay visible.  The JSON
+    rally boundary is not touched — this only pads the visual cut.
+    Successive rallies may overlap in the cut (rally N's tail can
+    contain frames that rally N+1 later replays from its start);
+    that is intentional and avoids merging distinct rallies just to
+    keep the tail.
     """
     if not rallies:
         print("[rally] no rallies detected; skipping cut video", flush=True)
@@ -778,6 +788,7 @@ def write_rally_video(
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_src_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     os.makedirs(os.path.dirname(dst_video) or ".", exist_ok=True)
     writer = cv2.VideoWriter(dst_video, cv2.VideoWriter_fourcc(*fourcc),
@@ -787,6 +798,7 @@ def write_rally_video(
         raise SystemExit("cannot open writer for " + dst_video)
 
     sep_frames = max(1, int(round(separator_seconds * fps)))
+    tail_frames = max(0, int(round(extra_tail_seconds * fps)))
     blank = np.zeros((H, W, 3), dtype=np.uint8)
 
     for r in rallies:
@@ -800,7 +812,10 @@ def write_rally_video(
             writer.write(title)
 
         cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, r.start_frame - 1))
-        n_needed = r.end_frame - r.start_frame + 1
+        clip_end = r.end_frame + tail_frames
+        if total_src_frames > 0:
+            clip_end = min(clip_end, total_src_frames)
+        n_needed = clip_end - r.start_frame + 1
         n_read = 0
         while n_read < n_needed:
             ret, frame = cap.read()

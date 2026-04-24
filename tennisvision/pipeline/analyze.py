@@ -884,11 +884,18 @@ def run(
 
         # Current rally (or -1 if this frame sits in a gap).  Used below
         # to reset HUD text and minimap bounces at rally boundaries.
+        # The bounce filter skips the pre_roll prefix — rally
+        # start_frame is `activity_start - pre_roll`, so the first
+        # `pre_roll_frames` of a rally are visual lead-in, not actual
+        # ball play; counting bounces there surfaces pickup-bounces
+        # from the preceding between-point stretch on the minimap
+        # before the rally has even started.
         ridx = frame_to_rally[frame_idx] if frame_to_rally else -1
         r_cur = rallies[ridx] if ridx >= 0 else None
         if r_cur is not None:
+            bounce_window_start = r_cur.start_frame + pre_roll_frames
             rally_bounces = [(x, y, f) for (x, y, f) in bounces_court
-                             if r_cur.start_frame <= f <= frame_idx]
+                             if bounce_window_start <= f <= frame_idx]
         else:
             rally_bounces = []
 
@@ -965,6 +972,8 @@ def run(
             write_rally_video(
                 output_path, clip_rallies, clip_path,
                 separator_seconds=float(rcfg_rally.get("separator_seconds", 1.0)),
+                extra_tail_seconds=float(
+                    rcfg_rally.get("clip_extra_tail_seconds", 0.0)),
             )
             print("[rally] wrote %s (%.1fs)" %
                   (clip_path, time.time() - t_cut), flush=True)
