@@ -17,6 +17,19 @@ sys.path.insert(
 from tennisvision.pipeline.rally import OnlineRallyDetector
 
 
+# Test footage is synthetic, but we mirror sample_short.mp4's 30fps so
+# the time-to-frames conversions below are readable.  Frame constants
+# are NEVER hardcoded — the time constants below are the source of
+# truth and every integer frame count is derived from them.
+_TEST_FPS = 30.0
+_DISCONTINUITY_NO_CROSS_SECONDS = 1.0       # shipping default
+_CROSSING_SILENCE_SECONDS = 4.0
+
+
+def _sec(seconds: float) -> int:
+    return int(round(seconds * _TEST_FPS))
+
+
 class _FakeChamp:
     def __init__(self, x: float, y: float, f: int) -> None:
         class _P:  # noqa: D401
@@ -30,10 +43,10 @@ class _FakeChamp:
 
 
 def _mk_det() -> OnlineRallyDetector:
-    # net_y_px matches sample_short.mp4 (669).  min_crossings=3 as in
-    # the shipping default; silence is set very large so nothing but
-    # the discontinuity gate (and the tests' own crossing_silence)
-    # can close bursts.
+    # net_y_px matches sample_short.mp4 (669).  Time constants come
+    # from the shipping config in seconds — frames are derived via
+    # _sec() so the intent stays readable and the test would still
+    # express the right durations if `_TEST_FPS` changed.
     return OnlineRallyDetector(
         net_y_px=669,
         silence_thresh_frames=9000,
@@ -41,9 +54,9 @@ def _mk_det() -> OnlineRallyDetector:
         pre_roll_frames=0,
         post_roll_frames=0,
         total_frames=100_000,
-        crossing_silence_thresh_frames=120,
+        crossing_silence_thresh_frames=_sec(_CROSSING_SILENCE_SECONDS),
         discontinuity_jump_px=120.0,
-        discontinuity_no_cross_frames=30,
+        discontinuity_no_cross_frames=_sec(_DISCONTINUITY_NO_CROSS_SECONDS),
     )
 
 
@@ -87,9 +100,10 @@ def test_lob_does_not_trigger() -> None:
     seq = [(f, 960, y_path[f]) for f in range(len(y_path))]
     # Tail silence on our side, no crossings — stretches time since
     # last crossing past the no_cross gate, testing that direction
-    # flip alone (with small jumps) still stays silent.
+    # flip alone (with small jumps) still stays silent.  Long enough
+    # (1.5s @ test fps) to clear `_DISCONTINUITY_NO_CROSS_SECONDS`.
     f_next = len(y_path)
-    for i in range(40):
+    for i in range(_sec(1.5)):
         seq.append((f_next + i, 960, 830))
     _drive(d, seq)
     assert d._discontinuity_closes == 0
@@ -108,11 +122,13 @@ def test_pickup_toss_triggers() -> None:
         seq.append((f, 500 + (f * 15) % 100, y_val))
         f += 1
     # Between-point quiet: ball hovers on our side, no crossings.
-    for i in range(40):
+    # Long enough (1.5s @ test fps) to clear the no_cross gate.
+    for i in range(_sec(1.5)):
         seq.append((f, 600, 820 + (i % 5)))
         f += 1
     # Teleport: ball jumps from ~x=600 to x=1400 (~800px jump), x
-    # direction flips from +x to -x, and time_since_cross >> 30f.
+    # direction flips from +x to -x, and time_since_cross is already
+    # past `_DISCONTINUITY_NO_CROSS_SECONDS`.
     seq.append((f, 1400, 700))
     f += 1
     for i in range(5):
