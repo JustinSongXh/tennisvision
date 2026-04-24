@@ -253,11 +253,13 @@ DEFAULTS: dict = {
         "require_bounces_both_halves": True,
         # Rally-merge pass: if two adjacent rallies sit less than
         # `merge_gap_seconds` apart AND no bounce falls inside the gap,
-        # merge them — a mid-rally tracking drop-out looks identical to
-        # a between-point silence at the detector level, but real
-        # between-point gaps contain pickup/dribble bounces whereas a
-        # ball-airborne-out-of-frame gap doesn't.  0 disables.
-        "merge_gap_seconds": 5.0,
+        # merge them.  Needed to undo the discontinuity gate's
+        # occasional over-splits (0-frame-gap splits at pickup false
+        # positives), but tightened from 5s because a wide window
+        # also fuses genuine rallies across a 递球 pause.  4s keeps
+        # the near-zero-gap false splits merged while leaving 5+s
+        # between-point breaks alone.
+        "merge_gap_seconds": 4.0,
         # Online mode: ball detection, tracker, rally detector AND
         # pose + stroke classifier all run together in a single pass,
         # so per-frame results are available live (for real-time
