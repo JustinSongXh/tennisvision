@@ -631,15 +631,19 @@ def run(
     # of points inside the inflated court polygon falls below
     # `ball.on_court_min_inside_fraction`.  Runs before inpainting /
     # bounce detection so adjacent-court tracks never contribute to
-    # either.  Also scrubs `frame_states` entries whose champion came
-    # from a dropped track, so Pass 2 doesn't render a ghost trail for
-    # it.  Per-track (not per-candidate) so a lone stray inside the
-    # polygon never kills a near-sideline legitimate track.
+    # either, but leaves `frame_states` untouched: Pass 2 trail render
+    # still uses the unfiltered tracker champion, so the filter can
+    # never erase a legitimate trail from the output video — only
+    # downstream artefacts (bounces, rally bounce-filter) see the
+    # narrowed track set.  Perspective stretch makes the 4m-margin
+    # polygon's near edge balloon off-screen, and the scrub-champion
+    # version of this filter was erasing too many legitimate trails
+    # when any single near-sideline track happened to sit mostly
+    # outside the polygon.
     # ------------------------------------------------------------------
     if (on_court_poly is not None and all_tracks
             and on_court_min_inside > 0.0):
         kept_tracks: list = []
-        kept_ids: set = set()
         dropped_ids: list = []
         for t in all_tracks:
             n_pts = len(t.pts)
@@ -652,25 +656,17 @@ def run(
             frac = n_inside / n_pts
             if frac >= on_court_min_inside:
                 kept_tracks.append(t)
-                kept_ids.add(t.id)
             else:
                 dropped_ids.append((t.id, n_pts, frac))
         if dropped_ids:
             print("[ball] adjacent-court filter dropped %d / %d tracks "
-                  "(min_inside=%.2f)"
+                  "for downstream (bounce/rally); render trails "
+                  "untouched (min_inside=%.2f)"
                   % (len(dropped_ids), len(all_tracks), on_court_min_inside),
                   flush=True)
             for tid, npts, frac in dropped_ids[:10]:
                 print("  [drop] track %d  n_pts=%d  inside=%.2f"
                       % (tid, npts, frac), flush=True)
-            # Scrub frame_states so Pass 2 doesn't render a trail from a
-            # dropped adjacent-court champion.
-            for fs in frame_states.values():
-                if (fs.champion_id is not None
-                        and fs.champion_id not in kept_ids):
-                    fs.champion_id = None
-                    fs.champion_trail = []
-                    fs.is_current_det = False
         all_tracks = kept_tracks
 
     # ------------------------------------------------------------------
