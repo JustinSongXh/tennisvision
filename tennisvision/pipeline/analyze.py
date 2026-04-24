@@ -965,6 +965,8 @@ def run(
             write_rally_video(
                 output_path, clip_rallies, clip_path,
                 separator_seconds=float(rcfg_rally.get("separator_seconds", 1.0)),
+                extra_tail_seconds=float(
+                    rcfg_rally.get("clip_extra_tail_seconds", 0.0)),
             )
             print("[rally] wrote %s (%.1fs)" %
                   (clip_path, time.time() - t_cut), flush=True)

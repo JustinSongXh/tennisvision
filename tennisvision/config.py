@@ -218,6 +218,15 @@ DEFAULTS: dict = {
         "pre_roll_seconds": 1.0,           # lead-in before first ball motion
         "post_roll_seconds": 1.0,          # kept after last ball motion
         "separator_seconds": 1.0,          # "Rally N" title between cut clips
+        # Extra tail appended to EACH rally in the cut video only —
+        # the JSON `end_frame` stays untouched.  Covers the trailing
+        # bounce / ball-roll seconds that follow the final stroke so
+        # the clip looks natural visually, without widening the rally
+        # window used by bounce / stroke / merge filters.  Rallies
+        # may overlap in the cut video (rally N's tail may replay a
+        # few frames that rally N+1 covers from its start) — that is
+        # intentional.
+        "clip_extra_tail_seconds": 2.0,
         # Output paths: None → derive from --out by replacing `.mp4`
         # with `_rally.mp4` / `_rallies.json`.
         "clip_path": None,
