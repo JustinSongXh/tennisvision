@@ -523,6 +523,37 @@ def run(
                   float(_rcfg.get("serve_soft_quiet_seconds", 1.0))),
               flush=True)
 
+    # Rally-level adjacent-court gate: accept candidates whose court-x
+    # projection lands on our court ±margin, reject those landing on
+    # neighbour courts.  Robust for airborne balls on our court (z=0
+    # projection error is dominated by court-y depth, not court-x).
+    # Tracker still sees raw candidates — only the online rally state
+    # machine's view gets narrowed, so tracker continuity is preserved
+    # and bounce / render pipelines unchanged.  <=0 disables.
+    rally_x_margin_m = float(_rcfg.get("on_court_x_margin_m", 0.0))
+    rally_x_gate_enabled = rally_x_margin_m > 0 and online_det is not None
+    _H_img_to_real_64 = (
+        np.asarray(calib.H_img_to_real, dtype=np.float64)
+        if rally_x_gate_enabled else None)
+    _rally_x_min = -rally_x_margin_m
+    _rally_x_max = ref.COURT_WIDTH_M + rally_x_margin_m
+    rally_filtered_cands = 0
+    rally_filtered_champions = 0
+    if rally_x_gate_enabled:
+        print("[rally] adjacent-court gate: court_x in [%.1fm, %.1fm] "
+              "(margin=%.1fm)"
+              % (_rally_x_min, _rally_x_max, rally_x_margin_m), flush=True)
+
+    def _project_court_x(x: float, y: float) -> Optional[float]:
+        """Return court_x meters for an image pixel, or None if the
+        homography row w collapses.  Only court_x is used; court_y is
+        unreliable for airborne balls."""
+        p = _H_img_to_real_64 @ np.array([x, y, 1.0])
+        w = p[2]
+        if abs(w) < 1e-9:
+            return None
+        return float(p[0] / w)
+
     pass_label = "pass 1 (online: ball+pose+tracker)" if online_mode \
         else "pass 1a (ball+tracker only)"
     print("[%s] %d frames ..." % (pass_label, total), flush=True)
@@ -548,7 +579,32 @@ def run(
                 retired_tracks[tid] = t
 
         if online_det is not None:
-            online_det.observe(frame_idx, cand_xys, champion)
+            # Build the rally detector's view of this frame.  Raw
+            # `cand_xys` still feed the tracker above; here we filter
+            # a separate list so adjacent-court balls cannot drive the
+            # rally state machine's crossing / silence counters.
+            if rally_x_gate_enabled and cand_xys:
+                rally_cands = []
+                for (cx, cy) in cand_xys:
+                    court_x = _project_court_x(cx, cy)
+                    if court_x is None:
+                        continue
+                    if _rally_x_min <= court_x <= _rally_x_max:
+                        rally_cands.append((cx, cy))
+                    else:
+                        rally_filtered_cands += 1
+            else:
+                rally_cands = cand_xys
+            rally_champ = champion
+            if (rally_x_gate_enabled and champion is not None
+                    and champion.pts):
+                last = champion.pts[-1]
+                court_x = _project_court_x(float(last.x), float(last.y))
+                if court_x is None or not (
+                        _rally_x_min <= court_x <= _rally_x_max):
+                    rally_champ = None
+                    rally_filtered_champions += 1
+            online_det.observe(frame_idx, rally_cands, rally_champ)
 
         fs = _FrameState(n_cands=len(cand_xys), n_tracks=len(tracker.tracks))
         if champion is not None:
@@ -604,6 +660,11 @@ def run(
                online_det._serve_toss_acted,
                online_det._serve_toss_detected
                    - online_det._serve_toss_acted),
+              flush=True)
+    if rally_x_gate_enabled:
+        print("[rally] adjacent-court gate dropped %d candidates and "
+              "masked champion on %d frames (rally view only)"
+              % (rally_filtered_cands, rally_filtered_champions),
               flush=True)
 
     # Also include tracks still alive after the last frame
