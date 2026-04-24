@@ -158,6 +158,21 @@ DEFAULTS: dict = {
         # genuine adjacent-court balls (court_x ~ -10m or +20m) are
         # cleanly excluded.  <= 0 disables the gate.
         "on_court_x_margin_m": 3.0,
+        # Discontinuity close: when the ball's observed position jumps
+        # by more than `discontinuity_jump_px` in one frame AND the
+        # motion direction flips (dot product of last vs current
+        # velocity vector < 0) AND no net crossing has happened for
+        # `discontinuity_no_cross_seconds`, the current burst is
+        # force-closed at the last stable frame.  Signals the ball
+        # has been picked up / tossed to a new position (between-point
+        # reset), which bounce/crossing-silence counters miss because
+        # casual pickup tosses keep producing slow crossings.  Real-
+        # rally bounces have LOW jump (tracker-continuous, typically
+        # 40-80 px) so they are not triggered; lobs similarly stay
+        # tracker-continuous with small frame-to-frame jumps.
+        # Jump <= 0 disables the signal.
+        "discontinuity_jump_px": 120.0,
+        "discontinuity_no_cross_seconds": 1.0,
         # Serve-toss based rally boundary (soft signal).  A confirmed
         # toss pattern (hold→rise→apex→descent, near a baseline, mostly
         # vertical) closes the current burst and starts a fresh rally
