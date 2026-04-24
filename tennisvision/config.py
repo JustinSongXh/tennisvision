@@ -146,6 +146,18 @@ DEFAULTS: dict = {
         "online_silence_lob_multiplier": 2.0,
         "online_silence_lob_up_speed_px": 2.0,   # min |vy| (image px/frame) that
                                                  # counts as "rising"; below is flat
+        # Rally-level adjacent-court gate: when the ball champion /
+        # first candidate sits outside [-margin, COURT_WIDTH+margin]
+        # in court-x meters (projected via H_img_to_real), the online
+        # detector sees it as "no ball on our court" this frame.  Only
+        # affects rally state machine (crossings, activity window);
+        # tracker, bounce detection, and render still see every raw
+        # candidate.  Court-x projection is robust for airborne balls
+        # on our court (z=0 projection error is mostly in court-y, not
+        # court-x), so lobs remain visible to the rally detector while
+        # genuine adjacent-court balls (court_x ~ -10m or +20m) are
+        # cleanly excluded.  <= 0 disables the gate.
+        "on_court_x_margin_m": 3.0,
         # Serve-toss based rally boundary (soft signal).  A confirmed
         # toss pattern (hold→rise→apex→descent, near a baseline, mostly
         # vertical) closes the current burst and starts a fresh rally
