@@ -64,11 +64,14 @@ class OnlineRallyDetector:
                  lob_silence_multiplier: float = 1.0,
                  lob_up_speed_px: float = 2.0,
                  serve_enabled: bool = False,
-                 serve_toss_rise_px: float = 120.0,
+                 serve_toss_rise_px_near: float = 132.0,
+                 serve_toss_rise_px_far: float = 33.0,
+                 near_baseline_y_px: Optional[float] = None,
+                 far_baseline_y_px: Optional[float] = None,
                  serve_toss_min_frames: int = 6,
                  serve_toss_max_horiz_ratio: float = 0.6,
                  serve_baseline_margin_m: float = 4.0,
-                 serve_pre_static_max_dy_px: float = 8.0,
+                 serve_pre_static_max_dy_px: float = 12.0,
                  serve_suppress_frames: int = 60,
                  serve_history_frames: int = 60,
                  serve_soft_quiet_frames: int = 30,
@@ -111,7 +114,20 @@ class OnlineRallyDetector:
         # Pure ball signal so it stays reliable when pose / player
         # detection misses the server (far side, occluded).
         self.serve_enabled = bool(serve_enabled)
-        self.serve_toss_rise_px = max(1.0, float(serve_toss_rise_px))
+        # Rise threshold is interpolated per-toss between near and far
+        # values based on the toss origin's image-y position between
+        # the two baselines (projected through H_real_to_img).  A toss
+        # from the near baseline covers many more image pixels than an
+        # identical-height toss from the far baseline because of
+        # perspective compression; a single global threshold either
+        # misses far tosses (too large) or false-fires on near noise
+        # (too small).
+        self.serve_toss_rise_px_near = max(1.0, float(serve_toss_rise_px_near))
+        self.serve_toss_rise_px_far = max(1.0, float(serve_toss_rise_px_far))
+        self.near_baseline_y_px = (
+            float(near_baseline_y_px) if near_baseline_y_px is not None else None)
+        self.far_baseline_y_px = (
+            float(far_baseline_y_px) if far_baseline_y_px is not None else None)
         self.serve_toss_min_frames = max(1, int(serve_toss_min_frames))
         self.serve_toss_max_horiz_ratio = max(0.0, float(serve_toss_max_horiz_ratio))
         self.serve_baseline_margin_m = max(0.0, float(serve_baseline_margin_m))
@@ -340,13 +356,24 @@ class OnlineRallyDetector:
         if len(self._ball_hist) < self.serve_toss_min_frames + 3:
             return None
 
-        # Apex = minimum y in the buffer.  Require at least 2 descending
-        # samples after it so we are not catching a mid-rise false alarm.
+        # Apex = minimum y in the buffer.  Relaxed from strict monotonic
+        # descent: the 2 post-apex samples must never dip BELOW apex
+        # height (that would mean apex wasn't actually the peak), AND
+        # at least one of them must be STRICTLY above apex (confirm
+        # real descent, not a 3-frame plateau that never fell).
+        # WASB detection noise can leave the image y flat for a frame
+        # around the peak, so an apex-height hold at +1 is fine as
+        # long as +2 shows the ball coming down.
         hist = list(self._ball_hist)
         apex_i = min(range(len(hist)), key=lambda i: hist[i][2])
         if apex_i == 0 or apex_i > len(hist) - 3:
             return None
-        if not (hist[apex_i][2] < hist[apex_i + 1][2] < hist[apex_i + 2][2]):
+        apex_y = hist[apex_i][2]
+        post1_y = hist[apex_i + 1][2]
+        post2_y = hist[apex_i + 2][2]
+        if post1_y < apex_y or post2_y < apex_y:
+            return None
+        if post1_y == apex_y and post2_y == apex_y:
             return None
 
         # Locate the start of the rise: scan backward from the apex for
@@ -376,7 +403,28 @@ class OnlineRallyDetector:
         rise_px = origin_y - apex_y
         duration = apex_f - origin_f
         horiz = abs(apex_x - origin_x)
-        if rise_px < self.serve_toss_rise_px:
+        # Adaptive rise threshold: interpolate between the near- and
+        # far-baseline settings based on the toss origin's image-y
+        # between the two baseline projections.  Near baseline (large
+        # image y) needs a large rise; far baseline (small image y)
+        # needs a small one because perspective squashes the toss
+        # image extent.  Falls back to the near value when baseline
+        # pixel positions were not supplied at construction.
+        if (self.near_baseline_y_px is not None
+                and self.far_baseline_y_px is not None):
+            span = self.near_baseline_y_px - self.far_baseline_y_px
+            if span > 1e-6:
+                t = max(0.0, min(1.0,
+                    (origin_y - self.far_baseline_y_px) / span))
+                rise_threshold = (
+                    self.serve_toss_rise_px_far
+                    + t * (self.serve_toss_rise_px_near
+                           - self.serve_toss_rise_px_far))
+            else:
+                rise_threshold = self.serve_toss_rise_px_near
+        else:
+            rise_threshold = self.serve_toss_rise_px_near
+        if rise_px < rise_threshold:
             return None
         if duration < self.serve_toss_min_frames:
             return None

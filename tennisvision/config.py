@@ -158,13 +158,22 @@ DEFAULTS: dict = {
         # your override yaml when between-points stretches keep
         # merging two real points into one burst.
         "serve_enabled": False,
-        "serve_toss_rise_ratio": 0.055,          # of frame diag (~121 px @ 1080p)
+        # Rise threshold adapts per-toss between near and far values by
+        # interpolating on the toss origin's image-y between the near-
+        # and far-baseline image projections — perspective compresses
+        # far-side toss image extent ~4x vs. near-side, so a single
+        # global ratio either misses far tosses (set too large) or
+        # false-fires on near-side rise noise (set too small).
+        "serve_toss_rise_ratio_near": 0.060,     # of frame diag (~132px @ 1080p)
+        "serve_toss_rise_ratio_far":  0.015,     # of frame diag (~33px  @ 1080p)
         "serve_toss_min_frames": 6,              # ~0.2s at 30fps
         "serve_toss_max_horiz_ratio": 0.6,       # |dx|/rise cap — filters lobs
         "serve_baseline_margin_m": 4.0,          # court-y distance from baseline
                                                  # that toss origin must sit within
-        "serve_pre_static_max_dy_px": 8.0,       # max |dy/df| (px/frame) for the
-                                                 # pre-toss "hold" frames
+        "serve_pre_static_max_dy_px": 12.0,      # max |dy/df| (px/frame) for the
+                                                 # pre-toss "hold" frames; WASB
+                                                 # per-frame jitter sits around
+                                                 # 7-8px so the gate needs headroom
         "serve_suppress_seconds": 2.0,           # re-detect cooldown per serve
         "serve_history_seconds": 2.0,            # ring buffer depth for toss pattern
         "serve_soft_quiet_seconds": 1.0,         # min time since last net crossing

@@ -435,6 +435,14 @@ def run(
     net_center = np.array([ref.COURT_WIDTH_M / 2.0, ref.NET_Y, 1.0])
     p_net = calib.H_real_to_img @ net_center
     net_y_px = float(p_net[1] / p_net[2])
+    # Near / far baseline image-y at court center — used by the toss
+    # detector to scale its rise threshold with perspective depth.
+    _near_real = np.array([ref.COURT_WIDTH_M / 2.0, 0.0, 1.0])
+    _p_near = calib.H_real_to_img @ _near_real
+    near_baseline_y_px = float(_p_near[1] / _p_near[2])
+    _far_real = np.array([ref.COURT_WIDTH_M / 2.0, ref.COURT_LENGTH_M, 1.0])
+    _p_far = calib.H_real_to_img @ _far_real
+    far_baseline_y_px = float(_p_far[1] / _p_far[2])
     silence_thresh = max(1, int(round(
         float(_rcfg.get("online_silence_seconds", 3.0)) * max(fps, 1.0))))
     pre_roll_frames = int(round(
@@ -448,8 +456,10 @@ def run(
         crossing_silence_thresh = int(round(
             float(_rcfg.get("online_crossing_silence_seconds", 0.0)) * max(fps, 1.0)))
         serve_enabled = bool(_rcfg.get("serve_enabled", False))
-        serve_rise_ratio = float(_rcfg.get("serve_toss_rise_ratio", 0.055))
-        serve_rise_px = max(1.0, serve_rise_ratio * frame_diag)
+        serve_rise_px_near = max(1.0, float(
+            _rcfg.get("serve_toss_rise_ratio_near", 0.060)) * frame_diag)
+        serve_rise_px_far = max(1.0, float(
+            _rcfg.get("serve_toss_rise_ratio_far", 0.015)) * frame_diag)
         serve_soft_quiet_frames = int(round(
             float(_rcfg.get("serve_soft_quiet_seconds", 1.0)) * max(fps, 1.0)))
         online_det = OnlineRallyDetector(
@@ -464,14 +474,17 @@ def run(
             lob_up_speed_px=float(
                 _rcfg.get("online_silence_lob_up_speed_px", 2.0)),
             serve_enabled=serve_enabled,
-            serve_toss_rise_px=serve_rise_px,
+            serve_toss_rise_px_near=serve_rise_px_near,
+            serve_toss_rise_px_far=serve_rise_px_far,
+            near_baseline_y_px=near_baseline_y_px,
+            far_baseline_y_px=far_baseline_y_px,
             serve_toss_min_frames=int(_rcfg.get("serve_toss_min_frames", 6)),
             serve_toss_max_horiz_ratio=float(
                 _rcfg.get("serve_toss_max_horiz_ratio", 0.6)),
             serve_baseline_margin_m=float(
                 _rcfg.get("serve_baseline_margin_m", 4.0)),
             serve_pre_static_max_dy_px=float(
-                _rcfg.get("serve_pre_static_max_dy_px", 8.0)),
+                _rcfg.get("serve_pre_static_max_dy_px", 12.0)),
             serve_suppress_frames=int(round(
                 float(_rcfg.get("serve_suppress_seconds", 2.0))
                 * max(fps, 1.0))),
@@ -488,8 +501,10 @@ def run(
         print("[rally] online detector: silence=%.1fs (lob x%.1f)  "
               "crossing_silence=%.1fs  min_crossings=%d  min_density=%.2f  "
               "pre/post_roll=%.1fs/%.1fs  net_y_px=%.0f  "
-              "serve=%s (rise>=%.0fpx, min=%df, horiz<=%.2f, "
-              "baseline<=%.1fm, soft_quiet=%.1fs)" % (
+              "baselines near/far=y%.0f/%.0f  "
+              "serve=%s (rise near/far=%.0f/%.0fpx, min=%df, "
+              "horiz<=%.2f, baseline<=%.1fm, pre_static<=%.1fpx, "
+              "soft_quiet=%.1fs)" % (
                   float(_rcfg.get("online_silence_seconds", 3.0)),
                   float(_rcfg.get("online_silence_lob_multiplier", 1.0)),
                   float(_rcfg.get("online_crossing_silence_seconds", 0.0)),
@@ -498,11 +513,13 @@ def run(
                   float(_rcfg.get("pre_roll_seconds", 1.0)),
                   float(_rcfg.get("post_roll_seconds", 1.0)),
                   net_y_px,
+                  near_baseline_y_px, far_baseline_y_px,
                   "on" if serve_enabled else "off",
-                  serve_rise_px,
+                  serve_rise_px_near, serve_rise_px_far,
                   int(_rcfg.get("serve_toss_min_frames", 6)),
                   float(_rcfg.get("serve_toss_max_horiz_ratio", 0.6)),
                   float(_rcfg.get("serve_baseline_margin_m", 4.0)),
+                  float(_rcfg.get("serve_pre_static_max_dy_px", 12.0)),
                   float(_rcfg.get("serve_soft_quiet_seconds", 1.0))),
               flush=True)
 
