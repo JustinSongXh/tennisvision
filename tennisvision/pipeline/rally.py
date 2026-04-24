@@ -19,8 +19,9 @@ from __future__ import annotations
 
 import json
 import os
+from collections import deque
 from dataclasses import asdict, dataclass
-from typing import Iterable, Optional
+from typing import Deque, Iterable, Optional
 
 import cv2
 import numpy as np
@@ -61,7 +62,21 @@ class OnlineRallyDetector:
                  crossing_silence_thresh_frames: int = 0,
                  min_activity_density: float = 0.0,
                  lob_silence_multiplier: float = 1.0,
-                 lob_up_speed_px: float = 2.0):
+                 lob_up_speed_px: float = 2.0,
+                 serve_enabled: bool = False,
+                 serve_toss_rise_px_near: float = 132.0,
+                 serve_toss_rise_px_far: float = 33.0,
+                 near_baseline_y_px: Optional[float] = None,
+                 far_baseline_y_px: Optional[float] = None,
+                 serve_toss_min_frames: int = 6,
+                 serve_toss_max_horiz_ratio: float = 0.6,
+                 serve_baseline_margin_m: float = 4.0,
+                 serve_pre_static_max_dy_px: float = 12.0,
+                 serve_suppress_frames: int = 60,
+                 serve_history_frames: int = 60,
+                 serve_soft_quiet_frames: int = 30,
+                 H_img_to_real: Optional[np.ndarray] = None,
+                 court_length_m: float = 23.77):
         self.net_y_px = float(net_y_px)
         self.silence_thresh = max(1, int(silence_thresh_frames))
         self.min_crossings = max(1, int(min_net_crossings))
@@ -86,6 +101,45 @@ class OnlineRallyDetector:
         # force-close the rally mid-flight.  1.0 disables the stretch.
         self.lob_silence_multiplier = max(1.0, float(lob_silence_multiplier))
         self.lob_up_speed_px = max(0.0, float(lob_up_speed_px))
+        # Serve detection: a confirmed toss pattern
+        #   hold → rise → apex → descent, near a baseline, mostly vertical
+        # is a SOFT signal that a new point is starting.  To avoid the
+        # false-positive mid-rally splits that made the previous
+        # force-close implementation (reverted 6eb789f) drop real
+        # rallies, we only act on a toss when the current burst also
+        # shows evidence of being between points: the last net crossing
+        # must be ≥ `serve_soft_quiet_frames` in the past.  Mid-rally
+        # there is a crossing every ~0.5s, so a 1s quiet window
+        # distinguishes "between points" from "mid-rally false rise".
+        # Pure ball signal so it stays reliable when pose / player
+        # detection misses the server (far side, occluded).
+        self.serve_enabled = bool(serve_enabled)
+        # Rise threshold is interpolated per-toss between near and far
+        # values based on the toss origin's image-y position between
+        # the two baselines (projected through H_real_to_img).  A toss
+        # from the near baseline covers many more image pixels than an
+        # identical-height toss from the far baseline because of
+        # perspective compression; a single global threshold either
+        # misses far tosses (too large) or false-fires on near noise
+        # (too small).
+        self.serve_toss_rise_px_near = max(1.0, float(serve_toss_rise_px_near))
+        self.serve_toss_rise_px_far = max(1.0, float(serve_toss_rise_px_far))
+        self.near_baseline_y_px = (
+            float(near_baseline_y_px) if near_baseline_y_px is not None else None)
+        self.far_baseline_y_px = (
+            float(far_baseline_y_px) if far_baseline_y_px is not None else None)
+        self.serve_toss_min_frames = max(1, int(serve_toss_min_frames))
+        self.serve_toss_max_horiz_ratio = max(0.0, float(serve_toss_max_horiz_ratio))
+        self.serve_baseline_margin_m = max(0.0, float(serve_baseline_margin_m))
+        self.serve_pre_static_max_dy_px = max(0.0, float(serve_pre_static_max_dy_px))
+        self.serve_suppress_frames = max(1, int(serve_suppress_frames))
+        self.serve_history_frames = max(
+            self.serve_toss_min_frames + 3, int(serve_history_frames))
+        self.serve_soft_quiet_frames = max(0, int(serve_soft_quiet_frames))
+        self.H_img_to_real = (
+            np.asarray(H_img_to_real, dtype=np.float64)
+            if H_img_to_real is not None else None)
+        self.court_length_m = float(court_length_m)
 
         self._activity_start: Optional[int] = None
         self._crossings = 0
@@ -100,14 +154,76 @@ class OnlineRallyDetector:
         self._last_ball_y: Optional[float] = None
         self._prev_ball_frame: Optional[int] = None
         self._prev_ball_y: Optional[float] = None
+        # Ball (frame, x, y) ring buffer for serve toss detection.
+        self._ball_hist: Deque[tuple[int, float, float]] = deque()
+        self._last_serve_frame: Optional[int] = None
+        # Counters for the run summary: tosses we saw vs. tosses we
+        # acted on (the rest were suppressed by the soft-quiet gate).
+        self._serve_toss_detected = 0
+        self._serve_toss_acted = 0
         self.rallies: list[Rally] = []
 
     # ------------------------------------------------------------------
     def observe(self, frame_idx: int, cand_xys: list, champion) -> None:
         has_ball = bool(cand_xys)
         ball_y: Optional[float] = None
+        ball_x: Optional[float] = None
 
         if has_ball:
+            # Prefer the tracker's current-frame ball position (cleaner),
+            # fall back to the first raw candidate.
+            if (champion is not None and champion.pts
+                    and champion.last_det_frame == frame_idx):
+                ball_x = float(champion.pts[-1].x)
+                ball_y = float(champion.pts[-1].y)
+            elif cand_xys:
+                ball_x = float(cand_xys[0][0])
+                ball_y = float(cand_xys[0][1])
+
+            # Serve detection runs BEFORE activity_start bookkeeping so
+            # a confirmed toss can close the current burst and start a
+            # fresh one at the toss frame — but only if the burst looks
+            # like it is genuinely between points (soft-quiet gate).
+            toss_start: Optional[int] = None
+            if (self.serve_enabled
+                    and ball_x is not None and ball_y is not None):
+                toss_start = self._detect_serve(frame_idx, ball_x, ball_y)
+            if toss_start is not None:
+                self._serve_toss_detected += 1
+                # Soft gate: during a mid-rally burst, net crossings
+                # happen every ~0.5s.  If the most recent *actual*
+                # crossing was within `serve_soft_quiet_frames` of
+                # this toss, the toss is almost certainly a false
+                # rise (lob / high shot) rather than a real
+                # between-points toss — act on it and we would slice
+                # a legit rally in two, both halves likely failing
+                # min_crossings.  A burst with zero crossings can not
+                # become a rally anyway (min_crossings > 0), so we
+                # pass the toss through — splitting a warm-up burst
+                # costs nothing and lets the new point start cleanly.
+                quiet_ok = (
+                    self._activity_start is None
+                    or self._crossings == 0
+                    or (frame_idx - self._last_crossing_frame)
+                        >= self.serve_soft_quiet_frames)
+                self._last_serve_frame = frame_idx
+                if quiet_ok:
+                    self._serve_toss_acted += 1
+                    if (self._activity_start is not None
+                            and self._activity_start < toss_start):
+                        self._close_at(toss_start - 1)
+                        self._reset()
+                    # Open a fresh burst at the toss frame, backfilling
+                    # activity_frames from the ball history so the
+                    # density gate still sees the toss window.
+                    self._activity_start = toss_start
+                    self._activity_frames = sum(
+                        1 for (f, _x, _y) in self._ball_hist if f >= toss_start)
+                    self._silent = 0
+                    self._crossings = 0
+                    self._last_side = None
+                    self._last_crossing_frame = toss_start
+
             if self._activity_start is None:
                 self._activity_start = frame_idx
                 self._crossings = 0
@@ -117,13 +233,6 @@ class OnlineRallyDetector:
             self._silent = 0
             self._activity_frames += 1
 
-            # Prefer the tracker's current-frame ball position (cleaner),
-            # fall back to the first raw candidate.
-            if (champion is not None and champion.pts
-                    and champion.last_det_frame == frame_idx):
-                ball_y = float(champion.pts[-1].y)
-            elif cand_xys:
-                ball_y = float(cand_xys[0][1])
             if ball_y is not None:
                 side = -1 if ball_y < self.net_y_px else 1
                 if self._last_side is not None and side != self._last_side:
@@ -207,6 +316,134 @@ class OnlineRallyDetector:
                 n_events=self._activity_frames,
                 net_crossings=self._crossings,
             ))
+
+    def _detect_serve(self, frame_idx: int, x: float, y: float) -> Optional[int]:
+        """Look for a serve toss in the recent ball trajectory.
+
+        Append (frame, x, y) to the history, then check for a
+        "hold → rise → apex → descent" pattern:
+        - apex (minimum y) sits inside the buffer, followed by ≥2
+          descending samples — apex is confirmed, not a mid-rise
+          reading
+        - backward from the apex, find the toss origin: the last point
+          preceded by ≥2 quasi-static frames
+          (|dy/df| ≤ serve_pre_static_max_dy_px).  Distinguishes a real
+          toss release from any rally rise — rally balls never come
+          to rest
+        - rise origin→apex ≥ `serve_toss_rise_px`, over ≥
+          `serve_toss_min_frames`
+        - horizontal drift ≤ `serve_toss_max_horiz_ratio × rise` —
+          filters cross-court lobs
+        - origin projects within `serve_baseline_margin_m` of either
+          baseline (z=0 projection is fine at the release: ball is
+          near hand-height, projection error small)
+
+        Returns the origin's frame index when a serve is confirmed,
+        else None.  Self-suppresses for `serve_suppress_frames` after
+        a hit so the same toss does not re-fire as the apex slides
+        through the buffer.
+        """
+        self._ball_hist.append((frame_idx, x, y))
+        while (self._ball_hist
+               and (frame_idx - self._ball_hist[0][0])
+                   > self.serve_history_frames):
+            self._ball_hist.popleft()
+
+        if (self._last_serve_frame is not None
+                and (frame_idx - self._last_serve_frame)
+                    < self.serve_suppress_frames):
+            return None
+        if len(self._ball_hist) < self.serve_toss_min_frames + 3:
+            return None
+
+        # Apex = minimum y in the buffer.  Relaxed from strict monotonic
+        # descent: the 2 post-apex samples must never dip BELOW apex
+        # height (that would mean apex wasn't actually the peak), AND
+        # at least one of them must be STRICTLY above apex (confirm
+        # real descent, not a 3-frame plateau that never fell).
+        # WASB detection noise can leave the image y flat for a frame
+        # around the peak, so an apex-height hold at +1 is fine as
+        # long as +2 shows the ball coming down.
+        hist = list(self._ball_hist)
+        apex_i = min(range(len(hist)), key=lambda i: hist[i][2])
+        if apex_i == 0 or apex_i > len(hist) - 3:
+            return None
+        apex_y = hist[apex_i][2]
+        post1_y = hist[apex_i + 1][2]
+        post2_y = hist[apex_i + 2][2]
+        if post1_y < apex_y or post2_y < apex_y:
+            return None
+        if post1_y == apex_y and post2_y == apex_y:
+            return None
+
+        # Locate the start of the rise: scan backward from the apex for
+        # the last point where the ball was essentially at rest
+        # (per-frame |dy| <= serve_pre_static_max_dy_px).  That point
+        # is the toss origin — the moment the ball was released.
+        # Require at least 2 static frames before the release so we do
+        # not confuse a fast-moving rally-shot rise with a toss.
+        static_max = self.serve_pre_static_max_dy_px
+        origin_i: Optional[int] = None
+        static_run = 0
+        for i in range(apex_i - 1, 0, -1):
+            df = max(1, hist[i][0] - hist[i - 1][0])
+            dy = abs(hist[i][2] - hist[i - 1][2]) / df
+            if dy <= static_max:
+                static_run += 1
+                if static_run >= 2:
+                    origin_i = i
+                    break
+            else:
+                static_run = 0
+        if origin_i is None:
+            return None
+
+        origin_f, origin_x, origin_y = hist[origin_i]
+        apex_f, apex_x, apex_y = hist[apex_i]
+        rise_px = origin_y - apex_y
+        duration = apex_f - origin_f
+        horiz = abs(apex_x - origin_x)
+        # Adaptive rise threshold: interpolate between the near- and
+        # far-baseline settings based on the toss origin's image-y
+        # between the two baseline projections.  Near baseline (large
+        # image y) needs a large rise; far baseline (small image y)
+        # needs a small one because perspective squashes the toss
+        # image extent.  Falls back to the near value when baseline
+        # pixel positions were not supplied at construction.
+        if (self.near_baseline_y_px is not None
+                and self.far_baseline_y_px is not None):
+            span = self.near_baseline_y_px - self.far_baseline_y_px
+            if span > 1e-6:
+                t = max(0.0, min(1.0,
+                    (origin_y - self.far_baseline_y_px) / span))
+                rise_threshold = (
+                    self.serve_toss_rise_px_far
+                    + t * (self.serve_toss_rise_px_near
+                           - self.serve_toss_rise_px_far))
+            else:
+                rise_threshold = self.serve_toss_rise_px_near
+        else:
+            rise_threshold = self.serve_toss_rise_px_near
+        if rise_px < rise_threshold:
+            return None
+        if duration < self.serve_toss_min_frames:
+            return None
+        if horiz > self.serve_toss_max_horiz_ratio * rise_px:
+            return None
+
+        if self.H_img_to_real is not None and self.serve_baseline_margin_m > 0:
+            p = self.H_img_to_real @ np.array([origin_x, origin_y, 1.0])
+            if abs(p[2]) < 1e-9:
+                return None
+            court_y = float(p[1] / p[2])
+            near_near = abs(court_y) <= self.serve_baseline_margin_m
+            near_far = (
+                abs(court_y - self.court_length_m)
+                <= self.serve_baseline_margin_m)
+            if not (near_near or near_far):
+                return None
+
+        return int(origin_f)
 
     def _effective_silence_thresh(self) -> int:
         """Silence threshold, stretched by `lob_silence_multiplier` when

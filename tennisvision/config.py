@@ -146,6 +146,39 @@ DEFAULTS: dict = {
         "online_silence_lob_multiplier": 2.0,
         "online_silence_lob_up_speed_px": 2.0,   # min |vy| (image px/frame) that
                                                  # counts as "rising"; below is flat
+        # Serve-toss based rally boundary (soft signal).  A confirmed
+        # toss pattern (hold→rise→apex→descent, near a baseline, mostly
+        # vertical) closes the current burst and starts a fresh rally
+        # at the toss frame — but ONLY if the burst has been quiet for
+        # `serve_soft_quiet_seconds` since its last net crossing.  That
+        # gate avoids the false mid-rally splits that made the earlier
+        # force-close implementation (reverted 6eb789f) drop real
+        # rallies.  Pure ball signal so it stays reliable when pose /
+        # player detection misses the server.  Default off; flip on in
+        # your override yaml when between-points stretches keep
+        # merging two real points into one burst.
+        "serve_enabled": False,
+        # Rise threshold adapts per-toss between near and far values by
+        # interpolating on the toss origin's image-y between the near-
+        # and far-baseline image projections — perspective compresses
+        # far-side toss image extent ~4x vs. near-side, so a single
+        # global ratio either misses far tosses (set too large) or
+        # false-fires on near-side rise noise (set too small).
+        "serve_toss_rise_ratio_near": 0.060,     # of frame diag (~132px @ 1080p)
+        "serve_toss_rise_ratio_far":  0.015,     # of frame diag (~33px  @ 1080p)
+        "serve_toss_min_frames": 6,              # ~0.2s at 30fps
+        "serve_toss_max_horiz_ratio": 0.6,       # |dx|/rise cap — filters lobs
+        "serve_baseline_margin_m": 4.0,          # court-y distance from baseline
+                                                 # that toss origin must sit within
+        "serve_pre_static_max_dy_px": 12.0,      # max |dy/df| (px/frame) for the
+                                                 # pre-toss "hold" frames; WASB
+                                                 # per-frame jitter sits around
+                                                 # 7-8px so the gate needs headroom
+        "serve_suppress_seconds": 2.0,           # re-detect cooldown per serve
+        "serve_history_seconds": 2.0,            # ring buffer depth for toss pattern
+        "serve_soft_quiet_seconds": 1.0,         # min time since last net crossing
+                                                 # for a toss to be trusted; 0 off
+                                                 # the soft gate (hard force-close)
         "online_crossing_silence_seconds": 4.0,  # force-close when ball is still in play
                                                  # but no net crossing for this long
                                                  # (catches pickup / dribble / toss gaps
