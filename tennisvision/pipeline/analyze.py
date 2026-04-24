@@ -523,25 +523,27 @@ def run(
                   float(_rcfg.get("serve_soft_quiet_seconds", 1.0))),
               flush=True)
 
-    # Rally-level adjacent-court gate: accept candidates whose court-x
-    # projection lands on our court ±margin, reject those landing on
-    # neighbour courts.  Robust for airborne balls on our court (z=0
-    # projection error is dominated by court-y depth, not court-x).
-    # Tracker still sees raw candidates — only the online rally state
-    # machine's view gets narrowed, so tracker continuity is preserved
-    # and bounce / render pipelines unchanged.  <=0 disables.
+    # Adjacent-court gate (court-x projection): accept observations
+    # whose court-x projection lands on our court ±margin.  Robust for
+    # airborne balls on our court (z=0 projection error is dominated
+    # by court-y depth, not court-x).  Tracker still sees raw
+    # candidates so continuity is preserved, but BOTH the online
+    # rally detector's view AND the render's champion trail run off
+    # the gated set — that way the rendered output no longer shows
+    # adjacent-court trajectories the tracker accidentally picks up.
+    # <= 0 disables.
     rally_x_margin_m = float(_rcfg.get("on_court_x_margin_m", 0.0))
-    rally_x_gate_enabled = rally_x_margin_m > 0 and online_det is not None
+    on_court_gate_enabled = rally_x_margin_m > 0
     _H_img_to_real_64 = (
         np.asarray(calib.H_img_to_real, dtype=np.float64)
-        if rally_x_gate_enabled else None)
+        if on_court_gate_enabled else None)
     _rally_x_min = -rally_x_margin_m
     _rally_x_max = ref.COURT_WIDTH_M + rally_x_margin_m
     rally_filtered_cands = 0
     rally_filtered_champions = 0
-    if rally_x_gate_enabled:
-        print("[rally] adjacent-court gate: court_x in [%.1fm, %.1fm] "
-              "(margin=%.1fm)"
+    if on_court_gate_enabled:
+        print("[ball] adjacent-court gate: court_x in [%.1fm, %.1fm] "
+              "(margin=%.1fm) — applies to rally detector AND render"
               % (_rally_x_min, _rally_x_max, rally_x_margin_m), flush=True)
 
     def _project_court_x(x: float, y: float) -> Optional[float]:
@@ -578,40 +580,42 @@ def run(
             if tid not in after_ids and t.validated:
                 retired_tracks[tid] = t
 
+        # Apply the court-x gate once per frame.  Raw `cand_xys` still
+        # drive the tracker above; the gated `on_court_cands` and
+        # `on_court_champ` feed both the rally state machine AND the
+        # frame_states record used by Pass 2 render, so adjacent-court
+        # tracks never surface as rendered trails either.
+        if on_court_gate_enabled and cand_xys:
+            on_court_cands = []
+            for (cx, cy) in cand_xys:
+                court_x = _project_court_x(cx, cy)
+                if court_x is None:
+                    continue
+                if _rally_x_min <= court_x <= _rally_x_max:
+                    on_court_cands.append((cx, cy))
+                else:
+                    rally_filtered_cands += 1
+        else:
+            on_court_cands = cand_xys
+        on_court_champ = champion
+        if (on_court_gate_enabled and champion is not None
+                and champion.pts):
+            last = champion.pts[-1]
+            court_x = _project_court_x(float(last.x), float(last.y))
+            if court_x is None or not (
+                    _rally_x_min <= court_x <= _rally_x_max):
+                on_court_champ = None
+                rally_filtered_champions += 1
+
         if online_det is not None:
-            # Build the rally detector's view of this frame.  Raw
-            # `cand_xys` still feed the tracker above; here we filter
-            # a separate list so adjacent-court balls cannot drive the
-            # rally state machine's crossing / silence counters.
-            if rally_x_gate_enabled and cand_xys:
-                rally_cands = []
-                for (cx, cy) in cand_xys:
-                    court_x = _project_court_x(cx, cy)
-                    if court_x is None:
-                        continue
-                    if _rally_x_min <= court_x <= _rally_x_max:
-                        rally_cands.append((cx, cy))
-                    else:
-                        rally_filtered_cands += 1
-            else:
-                rally_cands = cand_xys
-            rally_champ = champion
-            if (rally_x_gate_enabled and champion is not None
-                    and champion.pts):
-                last = champion.pts[-1]
-                court_x = _project_court_x(float(last.x), float(last.y))
-                if court_x is None or not (
-                        _rally_x_min <= court_x <= _rally_x_max):
-                    rally_champ = None
-                    rally_filtered_champions += 1
-            online_det.observe(frame_idx, rally_cands, rally_champ)
+            online_det.observe(frame_idx, on_court_cands, on_court_champ)
 
         fs = _FrameState(n_cands=len(cand_xys), n_tracks=len(tracker.tracks))
-        if champion is not None:
-            fs.champion_id = champion.id
-            fs.is_current_det = (champion.last_det_frame == frame_idx)
+        if on_court_champ is not None:
+            fs.champion_id = on_court_champ.id
+            fs.is_current_det = (on_court_champ.last_det_frame == frame_idx)
             fs.champion_trail = [
-                (p.x, p.y, p.frame) for p in champion.pts
+                (p.x, p.y, p.frame) for p in on_court_champ.pts
                 if frame_idx - p.frame <= tail_len
             ]
 
@@ -661,9 +665,9 @@ def run(
                online_det._serve_toss_detected
                    - online_det._serve_toss_acted),
               flush=True)
-    if rally_x_gate_enabled:
-        print("[rally] adjacent-court gate dropped %d candidates and "
-              "masked champion on %d frames (rally view only)"
+    if on_court_gate_enabled:
+        print("[ball] adjacent-court gate dropped %d candidates and "
+              "masked champion on %d frames (rally + render)"
               % (rally_filtered_cands, rally_filtered_champions),
               flush=True)
 
