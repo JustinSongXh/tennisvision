@@ -478,6 +478,11 @@ def run(
         from .rally import OnlineRallyDetector
         crossing_silence_thresh = int(round(
             float(_rcfg.get("online_crossing_silence_seconds", 0.0)) * max(fps, 1.0)))
+        serve_enabled = bool(_rcfg.get("serve_enabled", False))
+        serve_rise_ratio = float(_rcfg.get("serve_toss_rise_ratio", 0.055))
+        serve_rise_px = max(1.0, serve_rise_ratio * frame_diag)
+        serve_soft_quiet_frames = int(round(
+            float(_rcfg.get("serve_soft_quiet_seconds", 1.0)) * max(fps, 1.0)))
         online_det = OnlineRallyDetector(
             net_y_px=net_y_px,
             silence_thresh_frames=silence_thresh,
@@ -489,13 +494,33 @@ def run(
                 _rcfg.get("online_silence_lob_multiplier", 1.0)),
             lob_up_speed_px=float(
                 _rcfg.get("online_silence_lob_up_speed_px", 2.0)),
+            serve_enabled=serve_enabled,
+            serve_toss_rise_px=serve_rise_px,
+            serve_toss_min_frames=int(_rcfg.get("serve_toss_min_frames", 6)),
+            serve_toss_max_horiz_ratio=float(
+                _rcfg.get("serve_toss_max_horiz_ratio", 0.6)),
+            serve_baseline_margin_m=float(
+                _rcfg.get("serve_baseline_margin_m", 4.0)),
+            serve_pre_static_max_dy_px=float(
+                _rcfg.get("serve_pre_static_max_dy_px", 8.0)),
+            serve_suppress_frames=int(round(
+                float(_rcfg.get("serve_suppress_seconds", 2.0))
+                * max(fps, 1.0))),
+            serve_history_frames=int(round(
+                float(_rcfg.get("serve_history_seconds", 2.0))
+                * max(fps, 1.0))),
+            serve_soft_quiet_frames=serve_soft_quiet_frames,
+            H_img_to_real=calib.H_img_to_real,
+            court_length_m=ref.COURT_LENGTH_M,
             pre_roll_frames=pre_roll_frames,
             post_roll_frames=post_roll_frames,
             total_frames=total,
         )
         print("[rally] online detector: silence=%.1fs (lob x%.1f)  "
               "crossing_silence=%.1fs  min_crossings=%d  min_density=%.2f  "
-              "pre/post_roll=%.1fs/%.1fs  net_y_px=%.0f" % (
+              "pre/post_roll=%.1fs/%.1fs  net_y_px=%.0f  "
+              "serve=%s (rise>=%.0fpx, min=%df, horiz<=%.2f, "
+              "baseline<=%.1fm, soft_quiet=%.1fs)" % (
                   float(_rcfg.get("online_silence_seconds", 3.0)),
                   float(_rcfg.get("online_silence_lob_multiplier", 1.0)),
                   float(_rcfg.get("online_crossing_silence_seconds", 0.0)),
@@ -503,7 +528,14 @@ def run(
                   float(_rcfg.get("online_min_activity_density", 0.0)),
                   float(_rcfg.get("pre_roll_seconds", 1.0)),
                   float(_rcfg.get("post_roll_seconds", 1.0)),
-                  net_y_px), flush=True)
+                  net_y_px,
+                  "on" if serve_enabled else "off",
+                  serve_rise_px,
+                  int(_rcfg.get("serve_toss_min_frames", 6)),
+                  float(_rcfg.get("serve_toss_max_horiz_ratio", 0.6)),
+                  float(_rcfg.get("serve_baseline_margin_m", 4.0)),
+                  float(_rcfg.get("serve_soft_quiet_seconds", 1.0))),
+              flush=True)
 
     pass_label = "pass 1 (online: ball+pose+tracker)" if online_mode \
         else "pass 1a (ball+tracker only)"
@@ -579,6 +611,14 @@ def run(
            sum(1 for t in retired_tracks.values() if t.validated),
            len(rallies), len(stroke_events)),
           flush=True)
+    if online_det is not None and online_det.serve_enabled:
+        print("[rally] serve toss: %d detected, %d acted on, %d "
+              "suppressed by soft-quiet gate" %
+              (online_det._serve_toss_detected,
+               online_det._serve_toss_acted,
+               online_det._serve_toss_detected
+                   - online_det._serve_toss_acted),
+              flush=True)
 
     # Also include tracks still alive after the last frame
     for t in tracker.tracks:
