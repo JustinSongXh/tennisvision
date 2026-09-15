@@ -1,7 +1,5 @@
-# Model weights
-# (source checkpoints are tracked; runtime-generated ONNX exports aren't)
-weights/*.onnx
-weights/*.onnx.data
+# Model weights (download separately; not tracked in git)
+weights/
 
 # Sample media (also large)
 *.mp4
