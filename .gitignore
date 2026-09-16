@@ -33,3 +33,4 @@ __pycache__/
 
 # Claude Code local session state (memory, settings snapshots)
 .claude/
+yolo11*.pt
