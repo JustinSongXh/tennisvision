@@ -1,40 +1,30 @@
 #!/usr/bin/env python3
-"""TennisVision — Full rally detection pipeline.
+"""TennisVision — Rally detection pipeline.
 
-Constraints / Prerequisites:
-  - Fixed camera (single viewpoint, no camera movement)
-  - Court must be mostly visible in frame
-  - Doubles match (4 players expected)
-  - Overhand serve only (underhand not trained)
-  - Video resolution >= 720p (1080p recommended)
-  - Frame rate 30fps (other rates auto-adjusted)
+Full run (串行执行, 每步保存中间结果):
+    python scripts/run_full_pipeline.py --video samples/sample_short.mp4
 
-Pipeline steps:
-  Step 1: Court calibration      → calib.json + court_overlay.jpg
-  Step 2: Keypoints extraction   → keypoints.json (requires Kaggle GPU)
-  Step 3: Ball trajectory        → ball_positions.json
-  Step 4: Serve detection        → serve_events.json
-  Step 5: Rally detection        → rally_events.json
+Single step (单独跑某一步):
+    python scripts/run_full_pipeline.py --video samples/sample_short.mp4 --step 1
+    python scripts/run_full_pipeline.py --video samples/sample_short.mp4 --step 3
+    python scripts/run_full_pipeline.py --video samples/sample_short.mp4 --step 4
+    python scripts/run_full_pipeline.py --video samples/sample_short.mp4 --step 5
+
+Constraints:
+  · Fixed camera (no movement)
+  · Court visible in frame
+  · Doubles match (4 players)
+  · Overhand serve only
+  · Resolution >= 720p, 30fps recommended
+
+Steps:
+  1. Court calibration      → calib.json + court_overlay.jpg
+  2. Keypoints extraction   → keypoints.json (Kaggle GPU, manual)
+  3. Ball trajectory        → ball_positions.json
+  4. Serve detection        → serve_events.json
+  5. Rally detection        → rally_events.json + rally_cuts.mp4
 
 All outputs saved to results/<video_name>/.
-
-Usage:
-    # Full local run (with pre-extracted keypoints from Kaggle):
-    python scripts/run_full_pipeline.py \\
-        --video samples/sample_short.mp4 \\
-        --keypoints results/keypoints_all_frames_v6.json
-
-    # Skip ball trajectory (serve detection only):
-    python scripts/run_full_pipeline.py \\
-        --video samples/sample_short.mp4 \\
-        --keypoints results/keypoints_all_frames_v6.json \\
-        --skip-ball
-
-    # With existing calibration:
-    python scripts/run_full_pipeline.py \\
-        --video samples/sample_short.mp4 \\
-        --calib samples/calib_sample1.json \\
-        --keypoints results/keypoints_all_frames_v6.json
 """
 
 import argparse
@@ -49,55 +39,59 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def get_out_dir(video_path):
+    base = os.path.splitext(os.path.basename(video_path))[0]
+    d = os.path.join("results", base)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def print_banner(step_num, title):
+    print(f"\n{'='*60}")
+    print(f"  Step {step_num}: {title}")
+    print(f"{'='*60}")
+
+
 # ============================================================
 # Step 1: Court calibration
 # ============================================================
 
-def step1_calibration(video_path, calib_path, out_dir):
-    """Calibrate court → homography matrix + visualization."""
-    print("\n" + "=" * 60)
-    print("Step 1: Court Calibration")
-    print("=" * 60)
+def step1(video_path, out_dir):
+    print_banner(1, "Court Calibration")
 
-    if calib_path and os.path.exists(calib_path):
-        print(f"  Loading existing calibration: {calib_path}")
-        with open(calib_path) as f:
-            calib = json.load(f)
-        H = np.array(calib["H_img_to_real"], dtype=np.float64)
-        H_inv = np.array(calib["H_real_to_img"], dtype=np.float64)
-    else:
-        print(f"  Running auto-calibration on {video_path}...")
-        from tennisvision.court.calibration import load as load_calib
-
-        calib_out = os.path.join(out_dir, "calib.json")
-        os.system(
-            f"{sys.executable} scripts/calibrate.py blue-resnet "
-            f"--video {video_path} --out {calib_out} --vis {os.path.join(out_dir, 'court_overlay.jpg')}"
-        )
-        if not os.path.exists(calib_out):
-            print("  ❌ Calibration failed! Please provide --calib manually.")
-            sys.exit(1)
-        with open(calib_out) as f:
-            calib = json.load(f)
-        H = np.array(calib["H_img_to_real"], dtype=np.float64)
-        H_inv = np.array(calib["H_real_to_img"], dtype=np.float64)
-        calib_path = calib_out
-
-    # Generate court overlay visualization
+    calib_path = os.path.join(out_dir, "calib.json")
     vis_path = os.path.join(out_dir, "court_overlay.jpg")
-    if not os.path.exists(vis_path):
-        _draw_court_overlay(video_path, H_inv, calib.get("keypoints_img", {}), vis_path)
 
-    print(f"  ✅ Calibration loaded")
+    if os.path.exists(calib_path):
+        print(f"  ⏭️  Already exists: {calib_path}")
+        print(f"  Delete it to re-run calibration.")
+    else:
+        print(f"  Running auto-calibration...")
+        ret = os.system(
+            f"{sys.executable} scripts/calibrate.py blue-resnet "
+            f"--video {video_path} --out {calib_path} --vis {vis_path}"
+        )
+        if ret != 0 or not os.path.exists(calib_path):
+            print(f"  ❌ Calibration failed!")
+            print(f"  Try manual calibration: python scripts/calibrate.py mark --image <marked_image> --out {calib_path}")
+            return False
+
+    # 画 court overlay
+    if not os.path.exists(vis_path) and os.path.exists(calib_path):
+        _draw_court_overlay(video_path, calib_path, vis_path)
+
+    print(f"  ✅ Calibration: {calib_path}")
     print(f"  📷 Court overlay: {vis_path}")
-    print(f"  ⚠️  Please verify the court lines match the video!")
+    print(f"  ⚠️  请检查 {vis_path}，确认球场线与实际画面对齐!")
+    return True
 
-    return H, H_inv, calib_path
 
-
-def _draw_court_overlay(video_path, H_inv, keypoints_img, out_path):
-    """Draw court lines on a video frame for verification."""
+def _draw_court_overlay(video_path, calib_path, vis_path):
     from tennisvision.court import reference as ref
+
+    with open(calib_path) as f:
+        calib = json.load(f)
+    H_inv = np.array(calib["H_real_to_img"], dtype=np.float64)
 
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, 300)
@@ -106,77 +100,71 @@ def _draw_court_overlay(video_path, H_inv, keypoints_img, out_path):
     if not ret:
         return
 
-    # Draw court lines
     for (x0, y0), (x1, y1) in ref.court_line_segments_m():
         p0 = H_inv @ [x0, y0, 1.0]
         p1 = H_inv @ [x1, y1, 1.0]
-        pt0 = (int(p0[0] / p0[2]), int(p0[1] / p0[2]))
-        pt1 = (int(p1[0] / p1[2]), int(p1[1] / p1[2]))
-        cv2.line(frame, pt0, pt1, (0, 255, 0), 3)
+        cv2.line(frame,
+                 (int(p0[0] / p0[2]), int(p0[1] / p0[2])),
+                 (int(p1[0] / p1[2]), int(p1[1] / p1[2])),
+                 (0, 255, 0), 3)
 
-    # Draw keypoints
-    for kid, (ix, iy) in keypoints_img.items():
+    for kid, (ix, iy) in calib.get("keypoints_img", {}).items():
         pt = (int(round(float(ix))), int(round(float(iy))))
         label = ref.LABELS.get(int(kid), str(kid))
         cv2.circle(frame, pt, 8, (0, 0, 255), -1)
         cv2.putText(frame, label, (pt[0] + 12, pt[1] + 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-    cv2.imwrite(out_path, frame)
+    cv2.imwrite(vis_path, frame)
 
 
 # ============================================================
 # Step 2: Keypoints extraction (Kaggle GPU)
 # ============================================================
 
-def step2_check_keypoints(keypoints_path, out_dir):
-    """Check keypoints file exists, print instructions if not."""
-    print("\n" + "=" * 60)
-    print("Step 2: Keypoints Extraction")
-    print("=" * 60)
+def step2(video_path, out_dir):
+    print_banner(2, "Keypoints Extraction (Kaggle GPU)")
 
-    if keypoints_path and os.path.exists(keypoints_path):
-        with open(keypoints_path) as f:
+    kp_path = os.path.join(out_dir, "keypoints.json")
+
+    if os.path.exists(kp_path):
+        with open(kp_path) as f:
             data = json.load(f)
-        total = data["total_frames"]
-        fps = data["fps"]
-        n_det = sum(len(fd["detections"]) for fd in data["frames"])
-        tids = set()
-        for fd in data["frames"]:
-            for d in fd["detections"]:
-                tids.add(d["tid"])
-        print(f"  ✅ Keypoints loaded: {total} frames, {n_det} detections, {len(tids)} track IDs")
-        return data
+        n = data["total_frames"]
+        print(f"  ✅ Already exists: {kp_path} ({n} frames)")
+        return True
 
-    print("  ❌ Keypoints file not found!")
+    print(f"  ❌ Keypoints file not found: {kp_path}")
     print()
-    print("  This step requires GPU. Run on Kaggle:")
-    print("    1. Upload video to Kaggle dataset")
-    print("    2. Run infer-stroke-gru kernel (uses yolo11m + yolo26s-pose)")
-    print("    3. Download keypoints_all_frames.json")
-    print(f"    4. Re-run with: --keypoints <path_to_json>")
-    sys.exit(1)
+    print(f"  这一步需要 GPU，请在 Kaggle 上执行:")
+    print(f"    1. 上传视频到 Kaggle dataset")
+    print(f"    2. 运行 infer-stroke-gru kernel (yolo11m + yolo26s-pose)")
+    print(f"    3. 下载 keypoints_all_frames.json")
+    print(f"    4. 重命名并放到: {kp_path}")
+    print()
+    print(f"  或指定已有的 keypoints 文件:")
+    print(f"    python scripts/run_full_pipeline.py --video {video_path} --keypoints <path>")
+    return False
 
 
 # ============================================================
 # Step 3: Ball trajectory
 # ============================================================
 
-def step3_ball_trajectory(video_path, config_path, out_dir):
-    """Extract ball positions with WASB + Kalman tracker."""
-    print("\n" + "=" * 60)
-    print("Step 3: Ball Trajectory")
-    print("=" * 60)
+def step3(video_path, out_dir, config_path=None):
+    print_banner(3, "Ball Trajectory")
 
     out_path = os.path.join(out_dir, "ball_positions.json")
+
     if os.path.exists(out_path):
-        print(f"  Loading existing: {out_path}")
         with open(out_path) as f:
             bp = json.load(f)
-        print(f"  ✅ {bp.get('n_detected', '?')} detected, {bp.get('n_predicted', '?')} predicted")
-        return out_path
+        print(f"  ⏭️  Already exists: {out_path}")
+        print(f"  {bp.get('n_detected', '?')} detected, {bp.get('n_predicted', '?')} predicted")
+        return True
 
-    print(f"  Extracting from {video_path} (CPU, ~13 fps with ONNX)...")
+    print(f"  Extracting ball positions (CPU, ~13 fps with ONNX)...")
+    print(f"  This may take a while for long videos.")
 
     from tennisvision.config import load_config
     from tennisvision.ball.wasb import WASBBallDetector, WASBConfig
@@ -201,7 +189,7 @@ def step3_ball_trajectory(video_path, config_path, out_dir):
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H_px = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     detected, predicted = {}, {}
@@ -230,39 +218,48 @@ def step3_ball_trajectory(video_path, config_path, out_dir):
         if fi % 500 == 0:
             elapsed = time.time() - t0
             eta = (total - fi) / max(fi / elapsed, 0.1)
-            print(f"    frame {fi}/{total}  {fi/elapsed:.1f} fps  eta {eta:.0f}s")
+            print(f"    frame {fi}/{total}  {fi / elapsed:.1f} fps  eta {eta:.0f}s")
     cap.release()
 
     output = {
         "video": os.path.basename(video_path),
-        "fps": fps, "total_frames": fi, "width": W, "height": H_px,
+        "fps": fps, "total_frames": fi, "width": W, "height": H,
         "n_detected": len(detected), "n_predicted": len(predicted),
         "detected": {str(k): v for k, v in sorted(detected.items())},
         "predicted": {str(k): v for k, v in sorted(predicted.items())},
     }
     with open(out_path, "w") as f:
         json.dump(output, f)
-    print(f"  ✅ {len(detected)} detected, {len(predicted)} predicted → {out_path}")
-    return out_path
+    print(f"  ✅ {len(detected)} detected, {len(predicted)} predicted")
+    print(f"  Saved: {out_path}")
+    return True
 
 
 # ============================================================
 # Step 4: Serve detection
 # ============================================================
 
-def step4_serve_detection(kp_data, gru_path, H_img_to_real, out_dir):
-    """Detect serve events: slot mapping + wrist trigger + GRU."""
-    print("\n" + "=" * 60)
-    print("Step 4: Serve Detection")
-    print("=" * 60)
+def step4(out_dir, keypoints_path=None, gru_path="weights/stroke_gru_v4_best.pt"):
+    print_banner(4, "Serve Detection")
 
     import torch
     from tennisvision.action.slot_mapper import SlotMapper, SLOT_NAMES
     from tennisvision.action.gru_classifier import StrokeGRU, LABELS
 
-    fps = kp_data["fps"]
-    mapper = SlotMapper(H_img_to_real)
+    # Load calib
+    calib_path = os.path.join(out_dir, "calib.json")
+    with open(calib_path) as f:
+        calib = json.load(f)
+    H = np.array(calib["H_img_to_real"], dtype=np.float64)
 
+    # Load keypoints
+    kp_path = keypoints_path or os.path.join(out_dir, "keypoints.json")
+    with open(kp_path) as f:
+        kp_data = json.load(f)
+    fps = kp_data["fps"]
+    print(f"  Keypoints: {kp_data['total_frames']} frames")
+
+    mapper = SlotMapper(H)
     gru = StrokeGRU(n_classes=4)
     gru.load_state_dict(torch.load(gru_path, map_location="cpu"))
     gru.eval()
@@ -274,11 +271,11 @@ def step4_serve_detection(kp_data, gru_path, H_img_to_real, out_dir):
     act = {s: False for s in range(4)}
     gap_ct = {s: 0 for s in range(4)}
     serve_hits, all_events = [], []
+    gru_count = 0
 
     for fd in kp_data["frames"]:
         fi = fd["frame"]
         slot_dets = mapper.assign(fd["detections"])
-
         for slot in range(4):
             if slot not in slot_dets:
                 if act[slot]:
@@ -286,20 +283,17 @@ def step4_serve_detection(kp_data, gru_path, H_img_to_real, out_dir):
                     if gap_ct[slot] > GAP_TOL:
                         act[slot] = False
                 continue
-
             det = slot_dets[slot]
             kp = np.stack([det["kp_norm_x"], det["kp_norm_y"]], axis=1).astype(np.float32)
             kp_buf[slot].append(kp)
             if len(kp_buf[slot]) > SEQ_LEN + 30:
                 kp_buf[slot] = kp_buf[slot][-(SEQ_LEN + 30):]
-
             speed = 0.0
             if prev_kp[slot] is not None:
                 for wi in [9, 10]:
                     speed += np.sqrt((kp[wi, 0] - prev_kp[slot][wi, 0]) ** 2 +
                                      (kp[wi, 1] - prev_kp[slot][wi, 1]) ** 2)
             prev_kp[slot] = kp
-
             if speed > SPEED_THR:
                 act[slot] = True
                 gap_ct[slot] = 0
@@ -307,11 +301,11 @@ def step4_serve_detection(kp_data, gru_path, H_img_to_real, out_dir):
                 gap_ct[slot] += 1
                 if gap_ct[slot] > GAP_TOL:
                     act[slot] = False
-
             if act[slot] and len(kp_buf[slot]) >= SEQ_LEN:
                 feat = np.array([k[:, :2].reshape(-1) for k in kp_buf[slot][-SEQ_LEN:]], dtype=np.float32)
                 with torch.no_grad():
                     probs = torch.softmax(gru(torch.FloatTensor(feat).unsqueeze(0)), dim=1)[0].numpy()
+                gru_count += 1
                 pred = int(np.argmax(probs))
                 all_events.append({
                     "frame": fi, "slot": slot, "slot_name": SLOT_NAMES[slot],
@@ -320,7 +314,7 @@ def step4_serve_detection(kp_data, gru_path, H_img_to_real, out_dir):
                 if probs[2] > SERVE_THR and slot >= 2:
                     serve_hits.append((fi, slot, float(probs[2])))
 
-    # Merge
+    # Merge consecutive serve hits
     merged = []
     if serve_hits:
         cs, ce, csl, cc = serve_hits[0][0], serve_hits[0][0], serve_hits[0][1], serve_hits[0][2]
@@ -338,9 +332,11 @@ def step4_serve_detection(kp_data, gru_path, H_img_to_real, out_dir):
 
     out_path = os.path.join(out_dir, "serve_events.json")
     with open(out_path, "w") as f:
-        json.dump({"serve_events": merged, "all_events": all_events}, f, indent=2)
+        json.dump({"serve_events": merged, "all_events": all_events,
+                    "stats": {"gru_invocations": gru_count}}, f, indent=2)
 
-    print(f"  ✅ {len(merged)} serve events detected")
+    print(f"  GRU invocations: {gru_count}")
+    print(f"  ✅ {len(merged)} serve events detected:")
     for s in merged:
         print(f"    🎾 {s['time']}s {s['slot_name']} conf={s['conf']}")
     print(f"  Saved: {out_path}")
@@ -351,52 +347,77 @@ def step4_serve_detection(kp_data, gru_path, H_img_to_real, out_dir):
 # Step 5: Rally detection
 # ============================================================
 
-def step5_rally_detection(serve_events, ball_path, H_img_to_real, fps, total_frames, video_path, out_dir):
-    """Detect rallies from serve events + ball trajectory."""
-    print("\n" + "=" * 60)
-    print("Step 5: Rally Detection")
-    print("=" * 60)
+def step5(video_path, out_dir):
+    print_banner(5, "Rally Detection")
 
     from tennisvision.pipeline.rally_fusion import MultiSignalRallyDetector, FusionRallyConfig
     from tennisvision.pipeline.rally import write_rally_video, save_rally_json
 
+    # Load calib
+    calib_path = os.path.join(out_dir, "calib.json")
+    with open(calib_path) as f:
+        calib = json.load(f)
+    H = np.array(calib["H_img_to_real"], dtype=np.float64)
+
+    # Load serves
+    serve_path = os.path.join(out_dir, "serve_events.json")
+    with open(serve_path) as f:
+        serve_data = json.load(f)
+    serves = serve_data["serve_events"]
+
+    # Load keypoints meta for fps/total_frames
+    kp_path = os.path.join(out_dir, "keypoints.json")
+    if not os.path.exists(kp_path):
+        # Try to find any keypoints file
+        for f in os.listdir(out_dir):
+            if "keypoints" in f and f.endswith(".json"):
+                kp_path = os.path.join(out_dir, f)
+                break
+    with open(kp_path) as f:
+        kp_meta = json.load(f)
+    fps = kp_meta["fps"]
+    total_frames = kp_meta["total_frames"]
+
+    # Load ball positions
+    ball_path = os.path.join(out_dir, "ball_positions.json")
     ball_positions = {}
-    if ball_path and os.path.exists(ball_path):
+    if os.path.exists(ball_path):
         with open(ball_path) as f:
             bp = json.load(f)
         ball_positions = {int(k): tuple(v) for k, v in bp.get("predicted", {}).items()}
+        print(f"  Ball positions: {len(ball_positions)} frames")
+    else:
+        print(f"  ⚠️  No ball trajectory, rally end detection may be less accurate")
 
-    # Net Y pixel from homography (court midpoint projection)
-    mid = [10.97 / 2, 23.77 / 2, 1.0]
-    H_inv = np.linalg.inv(H_img_to_real)
-    p = H_inv @ mid
+    # Net Y pixel
+    H_inv = np.linalg.inv(H)
+    p = H_inv @ [10.97 / 2, 23.77 / 2, 1.0]
     net_y_px = float(p[1] / p[2]) if abs(p[2]) > 1e-9 else 625.0
 
     detector = MultiSignalRallyDetector(FusionRallyConfig(no_cross_timeout_s=5.0, min_duration_s=2.0))
     rallies = detector.detect(
         total_frames, fps,
-        serve_events=serve_events,
+        serve_events=serves,
         ball_positions=ball_positions,
         net_y_px=net_y_px,
     )
 
-    # Save JSON
-    rally_json_path = os.path.join(out_dir, "rally_events.json")
-    save_rally_json(rallies, rally_json_path, fps=fps)
+    rally_json = os.path.join(out_dir, "rally_events.json")
+    save_rally_json(rallies, rally_json, fps=fps)
 
-    # Cut rally video
-    rally_video_path = os.path.join(out_dir, "rally_cuts.mp4")
+    rally_video = os.path.join(out_dir, "rally_cuts.mp4")
     if rallies:
-        write_rally_video(video_path, rallies, rally_video_path,
+        print(f"  Writing rally cut video...")
+        write_rally_video(video_path, rallies, rally_video,
                           separator_seconds=1.0, extra_tail_seconds=2.0)
 
-    print(f"  ✅ {len(rallies)} rallies detected")
+    print(f"  ✅ {len(rallies)} rallies detected:")
     for r in rallies:
         dur = (r.end_frame - r.start_frame) / fps
-        print(f"    📹 Rally {r.idx+1}: {r.start_frame/fps:.1f}s-{r.end_frame/fps:.1f}s ({dur:.1f}s)")
-    print(f"  Saved: {rally_json_path}")
+        print(f"    📹 Rally {r.idx + 1}: {r.start_frame / fps:.1f}s - {r.end_frame / fps:.1f}s ({dur:.1f}s)")
+    print(f"  Saved: {rally_json}")
     if rallies:
-        print(f"  Video: {rally_video_path}")
+        print(f"  Video: {rally_video}")
     return rallies
 
 
@@ -409,24 +430,30 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--video", required=True)
-    parser.add_argument("--calib", default=None, help="Court calibration JSON (auto-generate if not provided)")
-    parser.add_argument("--keypoints", required=True, help="Keypoints JSON from Kaggle")
-    parser.add_argument("--gru", default="weights/stroke_gru_v4_best.pt")
+    parser.add_argument("--step", type=int, default=0,
+                        help="Run single step (1-5). 0 = run all.")
+    parser.add_argument("--keypoints", default=None,
+                        help="Pre-extracted keypoints JSON (copies to output dir)")
     parser.add_argument("--config", default=None, help="YAML config for ball detector")
-    parser.add_argument("--skip-ball", action="store_true")
+    parser.add_argument("--gru", default="weights/stroke_gru_v4_best.pt")
     args = parser.parse_args()
 
-    # Create output directory: results/<video_name>/
-    base = os.path.splitext(os.path.basename(args.video))[0]
-    out_dir = os.path.join("results", base)
-    os.makedirs(out_dir, exist_ok=True)
+    out_dir = get_out_dir(args.video)
+
+    # If keypoints provided, copy/link to output dir
+    if args.keypoints and os.path.exists(args.keypoints):
+        dst = os.path.join(out_dir, "keypoints.json")
+        if not os.path.exists(dst):
+            import shutil
+            shutil.copy2(args.keypoints, dst)
+            print(f"Copied keypoints to {dst}")
 
     print()
     print("╔" + "═" * 58 + "╗")
     print("║" + "TennisVision — Rally Detection Pipeline".center(58) + "║")
     print("╠" + "═" * 58 + "╣")
-    print(f"║  Video:     {args.video:<44s} ║")
-    print(f"║  Output:    {out_dir + '/':<44s} ║")
+    print(f"║  Video:  {args.video:<48s} ║")
+    print(f"║  Output: {out_dir + '/':<48s} ║")
     print("╠" + "═" * 58 + "╣")
     print("║  Constraints:                                           ║")
     print("║    · Fixed camera (no movement)                         ║")
@@ -436,49 +463,44 @@ def main():
     print("║    · Resolution >= 720p, 30fps recommended              ║")
     print("╚" + "═" * 58 + "╝")
 
+    run_all = args.step == 0
+
     # Step 1
-    H, H_inv, calib_path = step1_calibration(args.video, args.calib, out_dir)
+    if run_all or args.step == 1:
+        if not step1(args.video, out_dir):
+            return
 
     # Step 2
-    kp_data = step2_check_keypoints(args.keypoints, out_dir)
-    fps = kp_data["fps"]
-    total_frames = kp_data["total_frames"]
+    if run_all or args.step == 2:
+        if not step2(args.video, out_dir):
+            if run_all:
+                print("\n  ⛔ Pipeline stopped. Complete step 2 manually, then re-run.")
+                return
 
     # Step 3
-    ball_path = None
-    if not args.skip_ball:
-        ball_path = step3_ball_trajectory(args.video, args.config, out_dir)
-    else:
-        existing = os.path.join(out_dir, "ball_positions.json")
-        if os.path.exists(existing):
-            ball_path = existing
-            print(f"\n  [ball] Using existing: {ball_path}")
-        else:
-            print(f"\n  [ball] Skipped (no ball trajectory)")
+    if run_all or args.step == 3:
+        step3(args.video, out_dir, args.config)
 
     # Step 4
-    serves = step4_serve_detection(kp_data, args.gru, H, out_dir)
+    if run_all or args.step == 4:
+        step4(out_dir, gru_path=args.gru)
 
     # Step 5
-    rallies = step5_rally_detection(serves, ball_path, H, fps, total_frames, args.video, out_dir)
+    if run_all or args.step == 5:
+        step5(args.video, out_dir)
 
-    # Summary
-    print()
-    print("╔" + "═" * 58 + "╗")
-    print("║" + "Pipeline Complete!".center(58) + "║")
-    print("╠" + "═" * 58 + "╣")
-    print(f"║  Serves detected:  {len(serves):<38d} ║")
-    print(f"║  Rallies detected: {len(rallies):<38d} ║")
-    print("╠" + "═" * 58 + "╣")
-    print(f"║  Output files in {out_dir + '/:':<40s} ║")
-    print("║    court_overlay.jpg    — verify court lines            ║")
-    print("║    serve_events.json    — serve timestamps              ║")
-    print("║    rally_events.json    — rally boundaries              ║")
-    if rallies:
-        print("║    rally_cuts.mp4       — rally highlight video         ║")
-    if ball_path:
-        print("║    ball_positions.json  — ball trajectory               ║")
-    print("╚" + "═" * 58 + "╝")
+    if run_all:
+        print()
+        print("╔" + "═" * 58 + "╗")
+        print("║" + "✅ Pipeline Complete!".center(58) + "║")
+        print("╠" + "═" * 58 + "╣")
+        print(f"║  Results in: {out_dir + '/':<44s} ║")
+        print("║    court_overlay.jpg  — verify court lines              ║")
+        print("║    serve_events.json  — serve timestamps                ║")
+        print("║    rally_events.json  — rally boundaries                ║")
+        print("║    rally_cuts.mp4     — rally highlight video           ║")
+        print("║    ball_positions.json — ball trajectory                ║")
+        print("╚" + "═" * 58 + "╝")
 
 
 if __name__ == "__main__":
