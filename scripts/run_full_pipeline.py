@@ -49,6 +49,8 @@ else:
     DET_DEVICE, POSE_DEVICE = "cpu", "cpu"
 
 USE_HALF = torch.cuda.is_available()  # FP16 only on GPU
+BALL_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BALL_RUNTIME = "torch" if torch.cuda.is_available() else "auto"  # GPU needs torch, CPU uses ONNX
 
 
 def get_out_dir(video_path):
@@ -175,7 +177,7 @@ def step3(video_path, out_dir, config_path=None):
         print(f"  {bp.get('n_detected', '?')} detected, {bp.get('n_predicted', '?')} predicted")
         return True
 
-    print(f"  Extracting ball positions (CPU, ~13 fps with ONNX)...")
+    print(f"  Extracting ball positions ({BALL_DEVICE}, runtime={BALL_RUNTIME})...")
     print(f"  This may take a while for long videos.")
 
     from tennisvision.config import load_config
@@ -186,8 +188,7 @@ def step3(video_path, out_dir, config_path=None):
     bcfg, tcfg = cfg["ball"], cfg["tracker"]
 
     det = WASBBallDetector(WASBConfig(
-        weights=bcfg["weights"], device="cpu",
-        runtime=bcfg.get("runtime", "auto"),
+        weights=bcfg["weights"], device=BALL_DEVICE, runtime=BALL_RUNTIME,
         score_threshold=bcfg.get("score_threshold", 0.5),
     ))
     tracker = MultiTrackManager(TrackerConfig(
@@ -448,7 +449,14 @@ def main():
                         help="Pre-extracted keypoints JSON (copies to output dir)")
     parser.add_argument("--config", default=None, help="YAML config for ball detector")
     parser.add_argument("--gru", default="weights/stroke_gru_v4_best.pt")
+    parser.add_argument("--no-half", action="store_true",
+                        help="Disable FP16 (use FP32 even on GPU)")
     args = parser.parse_args()
+
+    # Override global config if --no-half
+    global USE_HALF
+    if args.no_half:
+        USE_HALF = False
 
     out_dir = get_out_dir(args.video)
 
