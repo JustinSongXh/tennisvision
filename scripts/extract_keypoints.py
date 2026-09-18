@@ -57,9 +57,9 @@ def main():
         det_device, pose_device = 0, 0
     else:
         det_device, pose_device = "cpu", "cpu"
-    use_half = torch.cuda.is_available() and not args.no_half
+    quantize = "fp16" if (torch.cuda.is_available() and not args.no_half) else None
 
-    print(f"Device: det={det_device} pose={pose_device} half={use_half}")
+    print(f"Device: det={det_device} pose={pose_device} quantize={quantize}")
     det_model = YOLO("yolo11m.pt")
     pose_model = YOLO("yolo26s-pose.pt")
     CROP_PAD = 0.15
@@ -81,7 +81,7 @@ def main():
             break
         detections = []
         dr = det_model.track(frame, persist=True, verbose=False, classes=[0],
-                             conf=0.3, imgsz=1280, device=det_device, half=use_half)[0]
+                             conf=0.3, imgsz=1280, device=det_device, quantize=quantize)[0]
 
         if dr.boxes is not None and dr.boxes.id is not None:
             boxes = dr.boxes.xyxy.cpu().numpy().astype(int)
@@ -100,7 +100,7 @@ def main():
 
             prs = pose_model.predict(crops, verbose=False, classes=[0],
                                      conf=0.15, imgsz=640, device=pose_device,
-                                     half=use_half) if crops else []
+                                     quantize=quantize) if crops else []
 
             for j, i in enumerate(kept):
                 if j >= len(prs):
