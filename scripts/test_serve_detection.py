@@ -82,6 +82,8 @@ def main():
     parser.add_argument("--serve-threshold", type=float, default=0.8)
     parser.add_argument("--gap-tolerance", type=int, default=5)
     parser.add_argument("--seq-len", type=int, default=30)
+    parser.add_argument("--serve-far-only", action="store_true", default=True,
+                        help="Only accept serve from FAR slots (baseline)")
     args = parser.parse_args()
 
     # Load data
@@ -187,6 +189,9 @@ def main():
                 all_events.append(event)
 
                 if probs[2] > args.serve_threshold:
+                    # Filter: only FAR slots for serve (baseline position)
+                    if args.serve_far_only and slot < 2:
+                        continue
                     serve_hits.append((fi, slot, float(probs[2])))
 
     # Merge consecutive serve hits
