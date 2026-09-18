@@ -35,8 +35,20 @@ import time
 
 import cv2
 import numpy as np
+import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+# ---- Inference config (auto-detect hardware) ----
+if torch.cuda.device_count() >= 2:
+    DET_DEVICE, POSE_DEVICE = 0, 1
+elif torch.cuda.is_available():
+    DET_DEVICE, POSE_DEVICE = 0, 0
+else:
+    DET_DEVICE, POSE_DEVICE = "cpu", "cpu"
+
+USE_HALF = torch.cuda.is_available()  # FP16 only on GPU
 
 
 def get_out_dir(video_path):
