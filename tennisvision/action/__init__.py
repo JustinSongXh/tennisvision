@@ -1,20 +1,29 @@
 """Player action / stroke recognition.
 
-Three stages:
-  1. Detection + tracking + pose — YOLOPoseTracker (YOLO26n-pose + ByteTrack)
-     gives per-frame `{track_id: (bbox, Pose)}` in a single model call.
-  2. Classifier — GRU over a 30-frame sliding window of (y, x) keypoints,
-     emitting {backhand, forehand, neutral, serve} per tracked player.
+Two pipelines:
+
+1. **Legacy (single-pass)**: YOLOPoseTracker + RNN stroke classifier
+2. **Two-stage + GRU v4 (validated)**: yolo11m detect → 4-slot mapping →
+   yolo26s-pose keypoints → wrist trigger → GRU v4 → serve marking
+   See docs/experiment_log.md for details.
 
 Pretrained weights:
-  - yolo26n-pose.pt     ultralytics (player detection + pose)
-  - tennis_rnn.h5       antoinekeller/tennis_shot_recognition (stroke GRU)
+  - yolo26s-pose.pt           ultralytics (keypoint extraction)
+  - stroke_gru_v4_best.pt     THETIS smart-sliced (4-class GRU)
+  - action_mlp_bbox.pkl       Roboflow (single-frame MLP, backup)
 
-Heavy deps (`tensorflow`, `ultralytics`) are imported lazily inside the
-wrappers so this package stays importable without them.
+Heavy deps imported lazily.
 """
 
 from .pose import YOLOPoseTracker, YOLOPoseTrackerConfig, Pose
+from .slot_mapper import SlotMapper, SlotMapperConfig, SLOT_NAMES
+from .gru_classifier import (
+    GRUActionClassifier,
+    GRUClassifierConfig,
+    StrokeGRU,
+    ActionEvent,
+    LABELS,
+)
 from .stroke_classifier import (
     MultiPlayerStrokeRecognizer,
     StrokeClassifier,
@@ -23,6 +32,16 @@ from .stroke_classifier import (
 )
 
 __all__ = [
+    # New pipeline
+    "GRUActionClassifier",
+    "GRUClassifierConfig",
+    "StrokeGRU",
+    "ActionEvent",
+    "SlotMapper",
+    "SlotMapperConfig",
+    "SLOT_NAMES",
+    "LABELS",
+    # Legacy
     "MultiPlayerStrokeRecognizer",
     "Pose",
     "StrokeClassifier",
