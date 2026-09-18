@@ -99,13 +99,21 @@ def step1(video_path, out_dir, weights_dir="weights"):
     else:
         print(f"  Running auto-calibration...")
         import subprocess
+        calib_weights = os.path.join(weights_dir, "court_resnet.pth")
+        print(f"  Weights: {calib_weights} (exists={os.path.exists(calib_weights)})")
         ret = subprocess.run([
-            sys.executable, "scripts/calibrate.py", "blue-resnet",
+            sys.executable, "-u", "scripts/calibrate.py", "blue-resnet",
             "--video", video_path, "--out", calib_path, "--vis", vis_path,
-            "--weights", os.path.join(weights_dir, "court_resnet.pth"),
-        ])
+            "--weights", calib_weights,
+        ], capture_output=True, text=True)
+        if ret.stdout:
+            for line in ret.stdout.strip().splitlines():
+                print(f"  [calib] {line}")
+        if ret.stderr:
+            for line in ret.stderr.strip().splitlines():
+                print(f"  [calib:err] {line}")
         if ret.returncode != 0 or not os.path.exists(calib_path):
-            print(f"  ❌ Calibration failed!")
+            print(f"  ❌ Calibration failed! (exit code {ret.returncode})")
             return False
 
     if not os.path.exists(vis_path) and os.path.exists(calib_path):
