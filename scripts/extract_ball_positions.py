@@ -38,15 +38,20 @@ def main():
     parser.add_argument("--config", default=None)
     parser.add_argument("--out", required=True)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--weights", default=None,
+                        help="WASB weights path (overrides config)")
+    parser.add_argument("--max-frames", type=int, default=0,
+                        help="Limit frames (0=all)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     bcfg = cfg["ball"]
     tcfg = cfg["tracker"]
     device = args.device or bcfg.get("device", "cpu")
+    weights = args.weights or bcfg["weights"]
 
     det = WASBBallDetector(WASBConfig(
-        weights=bcfg["weights"],
+        weights=weights,
         device=device,
         runtime=bcfg.get("runtime", "auto"),
         score_threshold=bcfg.get("score_threshold", 0.5),
@@ -65,8 +70,9 @@ def main():
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"Video: {W}x{H} fps={fps:.1f} frames={total}")
-    print(f"Device: {device}")
+    TOTAL = min(total, args.max_frames) if args.max_frames > 0 else total
+    print(f"Video: {W}x{H} fps={fps:.1f} processing {TOTAL} frames")
+    print(f"Device: {device}  Weights: {weights}")
 
     # Per-frame: champion detected position + predicted position
     detected = {}     # frame -> [x, y]  (actual detection)
@@ -74,7 +80,7 @@ def main():
     fi = 0
     t0 = time.time()
 
-    while True:
+    while fi < TOTAL:
         ret, frame = cap.read()
         if not ret:
             break

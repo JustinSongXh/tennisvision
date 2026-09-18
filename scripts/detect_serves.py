@@ -1,21 +1,26 @@
-"""Serve detection test — final validated pipeline.
-
-Uses pre-extracted keypoints JSON (from Kaggle two-stage pipeline) to test
-serve detection locally without re-running YOLO inference.
+"""Serve detection using GRU stroke classifier on pre-extracted keypoints.
 
 Pipeline:
-  1. Load keypoints_all_frames.json (yolo11m + yolo26s-pose output)
-  2. Homography on-court filter
+  1. Load keypoints JSON (yolo11m + yolo26s-pose output)
+  2. Homography on-court filter (from --calib or hardcoded fallback)
   3. 4-slot spatial mapping (NEAR_L/R, FAR_L/R)
   4. Wrist speed trigger (threshold=0.15)
   5. GRU v4 inference during active periods (every frame)
   6. Serve marking (prob > 0.8, merge consecutive frames)
 
 Usage:
-    python scripts/test_serve_detection.py \
-        --keypoints results/keypoints_all_frames_v6.json \
+    # With calibration file (recommended)
+    python -u scripts/detect_serves.py \
+        --keypoints results/sample2/keypoints.json \
+        --calib results/sample2/calib.json \
         --gru weights/stroke_gru_v4_best.pt \
-        --out results/serve_events.json
+        --out results/sample2/serve_events.json
+
+    # Without calib (uses hardcoded fallback for sample_short.mp4)
+    python -u scripts/detect_serves.py \
+        --keypoints results/sample_short/keypoints.json \
+        --gru weights/stroke_gru_v4_best.pt \
+        --out results/sample_short/serve_events.json
 """
 
 import argparse
@@ -25,59 +30,28 @@ import sys
 
 import numpy as np
 import torch
-import torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from tennisvision.action.slot_mapper import SlotMapper, SLOT_NAMES
+from tennisvision.action.gru_classifier import StrokeGRU, LABELS as GRU_LABELS
 
-# ---- Court calibration (sample_short.mp4) ----
-H_IMG_TO_REAL = np.array([
+# ---- Hardcoded fallback (sample_short.mp4) ----
+_DEFAULT_H_IMG_TO_REAL = np.array([
     [-0.004212704126665825, -0.00958000348568168, 8.066176934954633],
     [9.370094579164494e-05, 0.01803202259785551, -15.976691289361806],
     [1.1053780957617317e-07, -0.0019774218879326623, 1.0],
 ], dtype=np.float64)
-COURT_W, COURT_L, MARGIN = 10.97, 23.77, 3.0
-NET_Y_M = COURT_L / 2
-
-
-def to_court(fx, fy):
-    p = H_IMG_TO_REAL @ [fx, fy, 1.0]
-    if abs(p[2]) < 1e-9:
-        return None, None
-    return p[0] / p[2], p[1] / p[2]
-
-
-def on_court(rx, ry):
-    return (-MARGIN <= rx <= COURT_W + MARGIN and -MARGIN <= ry <= COURT_L + MARGIN)
-
-
-def get_slot(rx, ry):
-    mid_x = COURT_W / 2
-    return (0 if rx < mid_x else 1) if ry < NET_Y_M else (2 if rx < mid_x else 3)
-
-
-SLOT_NAMES = {0: "NEAR_L", 1: "NEAR_R", 2: "FAR_L", 3: "FAR_R"}
-
-
-# ---- GRU model ----
-class StrokeGRU(nn.Module):
-    def __init__(self, input_dim=34, hidden=128, n_layers=2, n_classes=4):
-        super().__init__()
-        self.gru = nn.GRU(input_dim, hidden, n_layers, batch_first=True, dropout=0.3)
-        self.fc = nn.Sequential(
-            nn.Linear(hidden, 64), nn.ReLU(), nn.Dropout(0.3), nn.Linear(64, n_classes)
-        )
-
-    def forward(self, x):
-        _, h = self.gru(x)
-        return self.fc(h[-1])
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--keypoints", default="results/keypoints_all_frames_v6.json")
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--keypoints", required=True)
     parser.add_argument("--gru", default="weights/stroke_gru_v4_best.pt")
-    parser.add_argument("--out", default="results/serve_events.json")
+    parser.add_argument("--calib", default=None,
+                        help="calib.json with H_img_to_real (omit to use hardcoded fallback)")
+    parser.add_argument("--out", required=True)
     parser.add_argument("--speed-threshold", type=float, default=0.15)
     parser.add_argument("--serve-threshold", type=float, default=0.8)
     parser.add_argument("--gap-tolerance", type=int, default=5)
@@ -85,6 +59,17 @@ def main():
     parser.add_argument("--serve-far-only", action="store_true", default=True,
                         help="Only accept serve from FAR slots (baseline)")
     args = parser.parse_args()
+
+    # Load homography
+    if args.calib:
+        with open(args.calib) as f:
+            calib = json.load(f)
+        H_img_to_real = np.array(calib["H_img_to_real"], dtype=np.float64)
+        print(f"Calibration: {args.calib}")
+    else:
+        H_img_to_real = _DEFAULT_H_IMG_TO_REAL
+        print("Calibration: hardcoded fallback (sample_short.mp4)")
+    mapper = SlotMapper(H_img_to_real)
 
     # Load data
     print(f"Loading keypoints: {args.keypoints}")
@@ -98,7 +83,6 @@ def main():
     gru.load_state_dict(torch.load(args.gru, map_location="cpu"))
     gru.eval()
 
-    LABELS = {0: "backhand", 1: "forehand", 2: "serve", 3: "background"}
     SEQ_LEN = args.seq_len
 
     # Per-slot state
@@ -108,24 +92,12 @@ def main():
     gap_count = {s: 0 for s in range(4)}
 
     serve_hits = []
-    all_events = []  # all GRU outputs for debugging
+    all_events = []
     gru_count = 0
 
     for fd in data["frames"]:
         fi = fd["frame"]
-
-        # Assign detections to slots
-        slot_dets = {}
-        for det in fd["detections"]:
-            rx, ry = to_court(det["foot_x"], det["foot_y"])
-            if rx is None or not on_court(rx, ry):
-                continue
-            slot = get_slot(rx, ry)
-            cx = COURT_W * 0.25 if slot % 2 == 0 else COURT_W * 0.75
-            cy = COURT_L * 0.15 if slot < 2 else COURT_L * 0.85
-            dist = np.sqrt((rx - cx) ** 2 + (ry - cy) ** 2)
-            if slot not in slot_dets or dist < slot_dets[slot][0]:
-                slot_dets[slot] = (dist, det)
+        slot_dets = mapper.assign(fd["detections"])
 
         for slot in range(4):
             if slot not in slot_dets:
@@ -135,10 +107,8 @@ def main():
                         active[slot] = False
                 continue
 
-            det = slot_dets[slot][1]
-            xs = np.array(det["kp_norm_x"])
-            ys = np.array(det["kp_norm_y"])
-            kp = np.stack([xs, ys], axis=1)
+            det = slot_dets[slot]
+            kp = np.stack([det["kp_norm_x"], det["kp_norm_y"]], axis=1).astype(np.float32)
 
             kp_buffers[slot].append(kp)
             if len(kp_buffers[slot]) > SEQ_LEN + 30:
@@ -148,9 +118,8 @@ def main():
             speed = 0.0
             if prev_kps[slot] is not None:
                 for wi in [9, 10]:
-                    dx = kp[wi, 0] - prev_kps[slot][wi, 0]
-                    dy = kp[wi, 1] - prev_kps[slot][wi, 1]
-                    speed += np.sqrt(dx ** 2 + dy ** 2)
+                    speed += np.sqrt((kp[wi, 0] - prev_kps[slot][wi, 0]) ** 2 +
+                                     (kp[wi, 1] - prev_kps[slot][wi, 1]) ** 2)
             prev_kps[slot] = kp
 
             if speed > args.speed_threshold:
@@ -179,17 +148,13 @@ def main():
                     "time": round(fi / data["fps"], 2),
                     "slot": slot,
                     "slot_name": SLOT_NAMES[slot],
-                    "label": LABELS[pred],
+                    "label": GRU_LABELS[pred],
                     "conf": round(float(probs[pred]), 3),
-                    "probs": {LABELS[i]: round(float(probs[i]), 3) for i in range(4)},
-                    "wrist_speed": round(speed, 3),
-                    "foot_x": det["foot_x"],
-                    "foot_y": det["foot_y"],
+                    "probs": {GRU_LABELS[i]: round(float(probs[i]), 3) for i in range(4)},
                 }
                 all_events.append(event)
 
                 if probs[2] > args.serve_threshold:
-                    # Filter: only FAR slots for serve (baseline position)
                     if args.serve_far_only and slot < 2:
                         continue
                     serve_hits.append((fi, slot, float(probs[2])))
