@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
-"""TennisVision — Rally detection pipeline.
-
-Full run (串行执行, 每步保存中间结果):
-    python scripts/run_full_pipeline.py --video samples/sample_short.mp4
-
-Single step (单独跑某一步):
-    python scripts/run_full_pipeline.py --video samples/sample_short.mp4 --step 1
-    python scripts/run_full_pipeline.py --video samples/sample_short.mp4 --step 3
-    python scripts/run_full_pipeline.py --video samples/sample_short.mp4 --step 4
-    python scripts/run_full_pipeline.py --video samples/sample_short.mp4 --step 5
+"""TennisVision — Full rally detection pipeline.
 
 Constraints:
   · Fixed camera (no movement)
@@ -19,12 +10,29 @@ Constraints:
 
 Steps:
   1. Court calibration      → calib.json + court_overlay.jpg
-  2. Keypoints extraction   → keypoints.json (Kaggle GPU, manual)
-  3. Ball trajectory        → ball_positions.json
-  4. Serve detection        → serve_events.json
+  2. Keypoints extraction   → keypoints.json (yolo11m + yolo26s-pose)
+  3. Ball trajectory        → ball_positions.json (WASB + Kalman)
+  4. Serve detection        → serve_events.json (GRU v4 + wrist trigger)
   5. Rally detection        → rally_events.json + rally_cuts.mp4
 
 All outputs saved to results/<video_name>/.
+
+Usage:
+    # Full run
+    python scripts/run_full_pipeline.py --video samples/sample_short.mp4
+
+    # Single step
+    python scripts/run_full_pipeline.py --video samples/sample_short.mp4 --step 1
+
+    # With existing keypoints (skip step 2)
+    python scripts/run_full_pipeline.py --video samples/sample_short.mp4 \\
+        --keypoints results/keypoints.json
+
+    # Limit frames (for testing)
+    python scripts/run_full_pipeline.py --video samples/sample_short.mp4 --max-frames 1800
+
+    # Disable FP16
+    python scripts/run_full_pipeline.py --video samples/sample_short.mp4 --no-half
 """
 
 import argparse
@@ -39,8 +47,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-
-# ---- Inference config (auto-detect hardware) ----
+# ---- Hardware auto-detection ----
 if torch.cuda.device_count() >= 2:
     DET_DEVICE, POSE_DEVICE = 0, 1
 elif torch.cuda.is_available():
@@ -48,9 +55,9 @@ elif torch.cuda.is_available():
 else:
     DET_DEVICE, POSE_DEVICE = "cpu", "cpu"
 
-USE_HALF = torch.cuda.is_available()  # FP16 only on GPU
+USE_HALF = torch.cuda.is_available()
 BALL_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BALL_RUNTIME = "torch" if torch.cuda.is_available() else "auto"  # GPU needs torch, CPU uses ONNX
+BALL_RUNTIME = "torch" if torch.cuda.is_available() else "auto"
 
 
 def get_out_dir(video_path):
@@ -66,31 +73,40 @@ def print_banner(step_num, title):
     print(f"{'='*60}")
 
 
+def get_video_info(video_path):
+    cap = cv2.VideoCapture(video_path)
+    info = {
+        "fps": cap.get(cv2.CAP_PROP_FPS),
+        "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+        "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        "total_frames": int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
+    }
+    cap.release()
+    return info
+
+
 # ============================================================
 # Step 1: Court calibration
 # ============================================================
 
 def step1(video_path, out_dir):
     print_banner(1, "Court Calibration")
-
     calib_path = os.path.join(out_dir, "calib.json")
     vis_path = os.path.join(out_dir, "court_overlay.jpg")
 
     if os.path.exists(calib_path):
         print(f"  ⏭️  Already exists: {calib_path}")
-        print(f"  Delete it to re-run calibration.")
     else:
         print(f"  Running auto-calibration...")
-        ret = os.system(
-            f"{sys.executable} scripts/calibrate.py blue-resnet "
-            f"--video {video_path} --out {calib_path} --vis {vis_path}"
-        )
-        if ret != 0 or not os.path.exists(calib_path):
+        import subprocess
+        ret = subprocess.run([
+            sys.executable, "scripts/calibrate.py", "blue-resnet",
+            "--video", video_path, "--out", calib_path, "--vis", vis_path
+        ])
+        if ret.returncode != 0 or not os.path.exists(calib_path):
             print(f"  ❌ Calibration failed!")
-            print(f"  Try manual calibration: python scripts/calibrate.py mark --image <marked_image> --out {calib_path}")
             return False
 
-    # 画 court overlay
     if not os.path.exists(vis_path) and os.path.exists(calib_path):
         _draw_court_overlay(video_path, calib_path, vis_path)
 
@@ -102,83 +118,152 @@ def step1(video_path, out_dir):
 
 def _draw_court_overlay(video_path, calib_path, vis_path):
     from tennisvision.court import reference as ref
-
     with open(calib_path) as f:
         calib = json.load(f)
     H_inv = np.array(calib["H_real_to_img"], dtype=np.float64)
-
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, 300)
     ret, frame = cap.read()
     cap.release()
     if not ret:
         return
-
     for (x0, y0), (x1, y1) in ref.court_line_segments_m():
         p0 = H_inv @ [x0, y0, 1.0]
         p1 = H_inv @ [x1, y1, 1.0]
         cv2.line(frame,
-                 (int(p0[0] / p0[2]), int(p0[1] / p0[2])),
-                 (int(p1[0] / p1[2]), int(p1[1] / p1[2])),
+                 (int(p0[0]/p0[2]), int(p0[1]/p0[2])),
+                 (int(p1[0]/p1[2]), int(p1[1]/p1[2])),
                  (0, 255, 0), 3)
-
     for kid, (ix, iy) in calib.get("keypoints_img", {}).items():
         pt = (int(round(float(ix))), int(round(float(iy))))
         label = ref.LABELS.get(int(kid), str(kid))
         cv2.circle(frame, pt, 8, (0, 0, 255), -1)
-        cv2.putText(frame, label, (pt[0] + 12, pt[1] + 5),
+        cv2.putText(frame, label, (pt[0]+12, pt[1]+5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
     cv2.imwrite(vis_path, frame)
 
 
 # ============================================================
-# Step 2: Keypoints extraction (Kaggle GPU)
+# Step 2: Keypoints extraction
 # ============================================================
 
-def step2(video_path, out_dir):
-    print_banner(2, "Keypoints Extraction (Kaggle GPU)")
-
+def step2(video_path, out_dir, max_frames=0):
+    print_banner(2, "Keypoints Extraction")
     kp_path = os.path.join(out_dir, "keypoints.json")
 
     if os.path.exists(kp_path):
         with open(kp_path) as f:
             data = json.load(f)
-        n = data["total_frames"]
-        print(f"  ✅ Already exists: {kp_path} ({n} frames)")
-        return True
+        if data["total_frames"] > 0:
+            print(f"  ⏭️  Already exists: {kp_path} ({data['total_frames']} frames)")
+            return True
 
-    print(f"  ❌ Keypoints file not found: {kp_path}")
-    print()
-    print(f"  这一步需要 GPU，请在 Kaggle 上执行:")
-    print(f"    1. 上传视频到 Kaggle dataset")
-    print(f"    2. 运行 infer-stroke-gru kernel (yolo11m + yolo26s-pose)")
-    print(f"    3. 下载 keypoints_all_frames.json")
-    print(f"    4. 重命名并放到: {kp_path}")
-    print()
-    print(f"  或指定已有的 keypoints 文件:")
-    print(f"    python scripts/run_full_pipeline.py --video {video_path} --keypoints <path>")
-    return False
+    from ultralytics import YOLO
+
+    print(f"  Device: det={DET_DEVICE} pose={POSE_DEVICE} half={USE_HALF}")
+    det_model = YOLO("yolo11m.pt")
+    pose_model = YOLO("yolo26s-pose.pt")
+    CROP_PAD = 0.15
+
+    vinfo = get_video_info(video_path)
+    FPS, W, H = vinfo["fps"], vinfo["width"], vinfo["height"]
+    TOTAL = min(vinfo["total_frames"], max_frames) if max_frames > 0 else vinfo["total_frames"]
+    print(f"  Video: {W}x{H} fps={FPS:.1f} processing {TOTAL} frames")
+
+    frame_data = []
+    fi, t0 = 0, time.time()
+    cap = cv2.VideoCapture(video_path)
+
+    while fi < TOTAL:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        detections = []
+        dr = det_model.track(frame, persist=True, verbose=False, classes=[0],
+                             conf=0.3, imgsz=1280, device=DET_DEVICE, half=USE_HALF)[0]
+
+        if dr.boxes is not None and dr.boxes.id is not None:
+            boxes = dr.boxes.xyxy.cpu().numpy().astype(int)
+            ids = dr.boxes.id.cpu().numpy().astype(int)
+            confs = dr.boxes.conf.cpu().numpy()
+
+            crops, offsets, kept = [], [], []
+            for i in range(len(boxes)):
+                x0, y0, x1, y1 = boxes[i]
+                pad = int(CROP_PAD * max(x1-x0, y1-y0))
+                cx0, cy0 = max(0, x0-pad), max(0, y0-pad)
+                cx1, cy1 = min(W, x1+pad), min(H, y1+pad)
+                crops.append(frame[cy0:cy1, cx0:cx1])
+                offsets.append((cx0, cy0))
+                kept.append(i)
+
+            prs = pose_model.predict(crops, verbose=False, classes=[0],
+                                     conf=0.15, imgsz=640, device=POSE_DEVICE,
+                                     half=USE_HALF) if crops else []
+
+            for j, i in enumerate(kept):
+                if j >= len(prs):
+                    continue
+                pr = prs[j]
+                if pr.boxes is None or len(pr.boxes) == 0 or pr.keypoints is None:
+                    continue
+                best = int(pr.boxes.conf.cpu().numpy().argmax())
+                kp = pr.keypoints.data[best].cpu().numpy()
+                kp_x = kp[:, 0] + offsets[j][0]
+                kp_y = kp[:, 1] + offsets[j][1]
+                kp_v = kp[:, 2]
+                valid = kp_v >= 0.3
+                if valid.sum() < 3:
+                    continue
+                xn, xx = kp_x[valid].min(), kp_x[valid].max()
+                yn, yx = kp_y[valid].min(), kp_y[valid].max()
+                bw, bh = max(xx-xn, 1), max(yx-yn, 1)
+                detections.append({
+                    "tid": int(ids[i]), "det_conf": round(float(confs[i]), 3),
+                    "bbox": [int(boxes[i][0]), int(boxes[i][1]), int(boxes[i][2]), int(boxes[i][3])],
+                    "foot_x": round(float((boxes[i][0]+boxes[i][2])/2), 1),
+                    "foot_y": int(boxes[i][3]),
+                    "kp_x": [round(float(v), 4) for v in kp_x],
+                    "kp_y": [round(float(v), 4) for v in kp_y],
+                    "kp_v": [round(float(v), 3) for v in kp_v],
+                    "kp_norm_x": [round(float((kp_x[k]-xn)/bw), 4) for k in range(17)],
+                    "kp_norm_y": [round(float((kp_y[k]-yn)/bh), 4) for k in range(17)],
+                })
+
+        frame_data.append({"frame": fi, "detections": detections})
+        fi += 1
+        if fi % 500 == 0:
+            e = time.time() - t0
+            print(f"    frame {fi}/{TOTAL}  {fi/e:.1f} fps  eta {(TOTAL-fi)/(fi/e):.0f}s")
+
+    cap.release()
+    elapsed = time.time() - t0
+    print(f"  ✅ {fi} frames in {elapsed:.0f}s ({fi/max(elapsed,0.1):.1f} fps)")
+
+    with open(kp_path, "w") as f:
+        json.dump({"fps": FPS, "width": W, "height": H,
+                    "total_frames": fi, "frames": frame_data}, f)
+    print(f"  Saved: {kp_path}")
+    return True
 
 
 # ============================================================
 # Step 3: Ball trajectory
 # ============================================================
 
-def step3(video_path, out_dir, config_path=None):
+def step3(video_path, out_dir, config_path=None, max_frames=0):
     print_banner(3, "Ball Trajectory")
-
     out_path = os.path.join(out_dir, "ball_positions.json")
 
     if os.path.exists(out_path):
         with open(out_path) as f:
             bp = json.load(f)
-        print(f"  ⏭️  Already exists: {out_path}")
-        print(f"  {bp.get('n_detected', '?')} detected, {bp.get('n_predicted', '?')} predicted")
-        return True
+        if bp.get("total_frames", 0) > 0:
+            print(f"  ⏭️  Already exists: {out_path}")
+            print(f"  {bp.get('n_detected','?')} detected, {bp.get('n_predicted','?')} predicted")
+            return True
 
-    print(f"  Extracting ball positions ({BALL_DEVICE}, runtime={BALL_RUNTIME})...")
-    print(f"  This may take a while for long videos.")
+    print(f"  Device: {BALL_DEVICE} runtime={BALL_RUNTIME}")
 
     from tennisvision.config import load_config
     from tennisvision.ball.wasb import WASBBallDetector, WASBConfig
@@ -192,22 +277,19 @@ def step3(video_path, out_dir, config_path=None):
         score_threshold=bcfg.get("score_threshold", 0.5),
     ))
     tracker = MultiTrackManager(TrackerConfig(
-        gate_px=tcfg.get("gate_px", 120),
-        max_gap_frames=tcfg.get("max_gap_frames", 8),
-        min_len=tcfg.get("min_len", 3),
-        min_speed=tcfg.get("min_speed", 5.0),
+        gate_px=tcfg.get("gate_px", 120), max_gap_frames=tcfg.get("max_gap_frames", 8),
+        min_len=tcfg.get("min_len", 3), min_speed=tcfg.get("min_speed", 5.0),
         max_speed=tcfg.get("max_speed", 200.0),
     ))
 
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    vinfo = get_video_info(video_path)
+    FPS, W, H_px = vinfo["fps"], vinfo["width"], vinfo["height"]
+    TOTAL = min(vinfo["total_frames"], max_frames) if max_frames > 0 else vinfo["total_frames"]
 
     detected, predicted = {}, {}
     fi, t0 = 0, time.time()
-    while True:
+    cap = cv2.VideoCapture(video_path)
+    while fi < TOTAL:
         ret, frame = cap.read()
         if not ret:
             break
@@ -229,21 +311,19 @@ def step3(video_path, out_dir, config_path=None):
                 detected[fi] = [float(pt.x), float(pt.y)]
         fi += 1
         if fi % 500 == 0:
-            elapsed = time.time() - t0
-            eta = (total - fi) / max(fi / elapsed, 0.1)
-            print(f"    frame {fi}/{total}  {fi / elapsed:.1f} fps  eta {eta:.0f}s")
+            e = time.time() - t0
+            print(f"    frame {fi}/{TOTAL}  {fi/e:.1f} fps  eta {(TOTAL-fi)/(fi/e):.0f}s")
     cap.release()
 
-    output = {
-        "video": os.path.basename(video_path),
-        "fps": fps, "total_frames": fi, "width": W, "height": H,
-        "n_detected": len(detected), "n_predicted": len(predicted),
-        "detected": {str(k): v for k, v in sorted(detected.items())},
-        "predicted": {str(k): v for k, v in sorted(predicted.items())},
-    }
+    elapsed = time.time() - t0
+    print(f"  ✅ {len(detected)} detected, {len(predicted)} predicted in {elapsed:.0f}s")
+
     with open(out_path, "w") as f:
-        json.dump(output, f)
-    print(f"  ✅ {len(detected)} detected, {len(predicted)} predicted")
+        json.dump({"video": os.path.basename(video_path),
+                    "fps": FPS, "total_frames": fi, "width": W, "height": H_px,
+                    "n_detected": len(detected), "n_predicted": len(predicted),
+                    "detected": {str(k): v for k, v in sorted(detected.items())},
+                    "predicted": {str(k): v for k, v in sorted(predicted.items())}}, f)
     print(f"  Saved: {out_path}")
     return True
 
@@ -252,33 +332,28 @@ def step3(video_path, out_dir, config_path=None):
 # Step 4: Serve detection
 # ============================================================
 
-def step4(out_dir, keypoints_path=None, gru_path="weights/stroke_gru_v4_best.pt"):
+def step4(out_dir, gru_path="weights/stroke_gru_v4_best.pt"):
     print_banner(4, "Serve Detection")
-
-    import torch
     from tennisvision.action.slot_mapper import SlotMapper, SLOT_NAMES
     from tennisvision.action.gru_classifier import StrokeGRU, LABELS
 
-    # Load calib
     calib_path = os.path.join(out_dir, "calib.json")
     with open(calib_path) as f:
         calib = json.load(f)
     H = np.array(calib["H_img_to_real"], dtype=np.float64)
+    mapper = SlotMapper(H)
 
-    # Load keypoints
-    kp_path = keypoints_path or os.path.join(out_dir, "keypoints.json")
+    kp_path = os.path.join(out_dir, "keypoints.json")
     with open(kp_path) as f:
         kp_data = json.load(f)
     fps = kp_data["fps"]
     print(f"  Keypoints: {kp_data['total_frames']} frames")
 
-    mapper = SlotMapper(H)
     gru = StrokeGRU(n_classes=4)
     gru.load_state_dict(torch.load(gru_path, map_location="cpu"))
     gru.eval()
 
     SEQ_LEN, SPEED_THR, SERVE_THR, GAP_TOL = 30, 0.15, 0.8, 5
-
     kp_buf = {s: [] for s in range(4)}
     prev_kp = {s: None for s in range(4)}
     act = {s: False for s in range(4)}
@@ -304,18 +379,17 @@ def step4(out_dir, keypoints_path=None, gru_path="weights/stroke_gru_v4_best.pt"
             speed = 0.0
             if prev_kp[slot] is not None:
                 for wi in [9, 10]:
-                    speed += np.sqrt((kp[wi, 0] - prev_kp[slot][wi, 0]) ** 2 +
-                                     (kp[wi, 1] - prev_kp[slot][wi, 1]) ** 2)
+                    speed += np.sqrt((kp[wi,0]-prev_kp[slot][wi,0])**2 +
+                                     (kp[wi,1]-prev_kp[slot][wi,1])**2)
             prev_kp[slot] = kp
             if speed > SPEED_THR:
-                act[slot] = True
-                gap_ct[slot] = 0
+                act[slot] = True; gap_ct[slot] = 0
             elif act[slot]:
                 gap_ct[slot] += 1
                 if gap_ct[slot] > GAP_TOL:
                     act[slot] = False
             if act[slot] and len(kp_buf[slot]) >= SEQ_LEN:
-                feat = np.array([k[:, :2].reshape(-1) for k in kp_buf[slot][-SEQ_LEN:]], dtype=np.float32)
+                feat = np.array([k[:,:2].reshape(-1) for k in kp_buf[slot][-SEQ_LEN:]], dtype=np.float32)
                 with torch.no_grad():
                     probs = torch.softmax(gru(torch.FloatTensor(feat).unsqueeze(0)), dim=1)[0].numpy()
                 gru_count += 1
@@ -327,7 +401,7 @@ def step4(out_dir, keypoints_path=None, gru_path="weights/stroke_gru_v4_best.pt"
                 if probs[2] > SERVE_THR and slot >= 2:
                     serve_hits.append((fi, slot, float(probs[2])))
 
-    # Merge consecutive serve hits
+    # Merge
     merged = []
     if serve_hits:
         cs, ce, csl, cc = serve_hits[0][0], serve_hits[0][0], serve_hits[0][1], serve_hits[0][2]
@@ -337,11 +411,11 @@ def step4(out_dir, keypoints_path=None, gru_path="weights/stroke_gru_v4_best.pt"
             else:
                 merged.append({"frame": cs, "end_frame": ce, "slot": csl,
                                "slot_name": SLOT_NAMES[csl], "conf": round(cc, 3),
-                               "time": round(cs / fps, 2)})
+                               "time": round(cs/fps, 2)})
                 cs, ce, csl, cc = fi, fi, sl, c
         merged.append({"frame": cs, "end_frame": ce, "slot": csl,
                         "slot_name": SLOT_NAMES[csl], "conf": round(cc, 3),
-                        "time": round(cs / fps, 2)})
+                        "time": round(cs/fps, 2)})
 
     out_path = os.path.join(out_dir, "serve_events.json")
     with open(out_path, "w") as f:
@@ -349,7 +423,7 @@ def step4(out_dir, keypoints_path=None, gru_path="weights/stroke_gru_v4_best.pt"
                     "stats": {"gru_invocations": gru_count}}, f, indent=2)
 
     print(f"  GRU invocations: {gru_count}")
-    print(f"  ✅ {len(merged)} serve events detected:")
+    print(f"  ✅ {len(merged)} serve events:")
     for s in merged:
         print(f"    🎾 {s['time']}s {s['slot_name']} conf={s['conf']}")
     print(f"  Saved: {out_path}")
@@ -362,36 +436,23 @@ def step4(out_dir, keypoints_path=None, gru_path="weights/stroke_gru_v4_best.pt"
 
 def step5(video_path, out_dir):
     print_banner(5, "Rally Detection")
-
     from tennisvision.pipeline.rally_fusion import MultiSignalRallyDetector, FusionRallyConfig
     from tennisvision.pipeline.rally import write_rally_video, save_rally_json
 
-    # Load calib
     calib_path = os.path.join(out_dir, "calib.json")
     with open(calib_path) as f:
         calib = json.load(f)
     H = np.array(calib["H_img_to_real"], dtype=np.float64)
 
-    # Load serves
     serve_path = os.path.join(out_dir, "serve_events.json")
     with open(serve_path) as f:
-        serve_data = json.load(f)
-    serves = serve_data["serve_events"]
+        serves = json.load(f)["serve_events"]
 
-    # Load keypoints meta for fps/total_frames
     kp_path = os.path.join(out_dir, "keypoints.json")
-    if not os.path.exists(kp_path):
-        # Try to find any keypoints file
-        for f in os.listdir(out_dir):
-            if "keypoints" in f and f.endswith(".json"):
-                kp_path = os.path.join(out_dir, f)
-                break
     with open(kp_path) as f:
         kp_meta = json.load(f)
-    fps = kp_meta["fps"]
-    total_frames = kp_meta["total_frames"]
+    fps, total_frames = kp_meta["fps"], kp_meta["total_frames"]
 
-    # Load ball positions
     ball_path = os.path.join(out_dir, "ball_positions.json")
     ball_positions = {}
     if os.path.exists(ball_path):
@@ -400,34 +461,29 @@ def step5(video_path, out_dir):
         ball_positions = {int(k): tuple(v) for k, v in bp.get("predicted", {}).items()}
         print(f"  Ball positions: {len(ball_positions)} frames")
     else:
-        print(f"  ⚠️  No ball trajectory, rally end detection may be less accurate")
+        print(f"  ⚠️  No ball trajectory")
 
-    # Net Y pixel
     H_inv = np.linalg.inv(H)
-    p = H_inv @ [10.97 / 2, 23.77 / 2, 1.0]
-    net_y_px = float(p[1] / p[2]) if abs(p[2]) > 1e-9 else 625.0
+    p = H_inv @ [10.97/2, 23.77/2, 1.0]
+    net_y_px = float(p[1]/p[2]) if abs(p[2]) > 1e-9 else 625.0
 
     detector = MultiSignalRallyDetector(FusionRallyConfig(no_cross_timeout_s=5.0, min_duration_s=2.0))
-    rallies = detector.detect(
-        total_frames, fps,
-        serve_events=serves,
-        ball_positions=ball_positions,
-        net_y_px=net_y_px,
-    )
+    rallies = detector.detect(total_frames, fps, serve_events=serves,
+                              ball_positions=ball_positions, net_y_px=net_y_px)
 
     rally_json = os.path.join(out_dir, "rally_events.json")
     save_rally_json(rallies, rally_json, fps=fps)
 
     rally_video = os.path.join(out_dir, "rally_cuts.mp4")
     if rallies:
-        print(f"  Writing rally cut video...")
+        print(f"  Writing rally video...")
         write_rally_video(video_path, rallies, rally_video,
                           separator_seconds=1.0, extra_tail_seconds=2.0)
 
-    print(f"  ✅ {len(rallies)} rallies detected:")
+    print(f"  ✅ {len(rallies)} rallies:")
     for r in rallies:
         dur = (r.end_frame - r.start_frame) / fps
-        print(f"    📹 Rally {r.idx + 1}: {r.start_frame / fps:.1f}s - {r.end_frame / fps:.1f}s ({dur:.1f}s)")
+        print(f"    📹 Rally {r.idx+1}: {r.start_frame/fps:.1f}s-{r.end_frame/fps:.1f}s ({dur:.1f}s)")
     print(f"  Saved: {rally_json}")
     if rallies:
         print(f"  Video: {rally_video}")
@@ -440,27 +496,22 @@ def step5(video_path, out_dir):
 
 def main():
     parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--video", required=True)
-    parser.add_argument("--step", type=int, default=0,
-                        help="Run single step (1-5). 0 = run all.")
-    parser.add_argument("--keypoints", default=None,
-                        help="Pre-extracted keypoints JSON (copies to output dir)")
+    parser.add_argument("--step", type=int, default=0, help="Single step (1-5). 0=all.")
+    parser.add_argument("--keypoints", default=None, help="Pre-extracted keypoints JSON")
     parser.add_argument("--config", default=None, help="YAML config for ball detector")
     parser.add_argument("--gru", default="weights/stroke_gru_v4_best.pt")
-    parser.add_argument("--no-half", action="store_true",
-                        help="Disable FP16 (use FP32 even on GPU)")
+    parser.add_argument("--max-frames", type=int, default=0, help="Limit frames (0=all)")
+    parser.add_argument("--no-half", action="store_true", help="Disable FP16")
     args = parser.parse_args()
 
-    # Override global config if --no-half
     global USE_HALF
     if args.no_half:
         USE_HALF = False
 
     out_dir = get_out_dir(args.video)
 
-    # If keypoints provided, copy/link to output dir
     if args.keypoints and os.path.exists(args.keypoints):
         dst = os.path.join(out_dir, "keypoints.json")
         if not os.path.exists(dst):
@@ -469,58 +520,47 @@ def main():
             print(f"Copied keypoints to {dst}")
 
     print()
-    print("╔" + "═" * 58 + "╗")
+    print("╔" + "═"*58 + "╗")
     print("║" + "TennisVision — Rally Detection Pipeline".center(58) + "║")
-    print("╠" + "═" * 58 + "╣")
-    print(f"║  Video:  {args.video:<48s} ║")
-    print(f"║  Output: {out_dir + '/':<48s} ║")
-    print("╠" + "═" * 58 + "╣")
+    print("╠" + "═"*58 + "╣")
+    print(f"║  Video:   {args.video:<47s} ║")
+    print(f"║  Output:  {out_dir+'/':<47s} ║")
+    print(f"║  Device:  det={DET_DEVICE} pose={POSE_DEVICE} half={USE_HALF!s:<23s} ║")
+    if args.max_frames > 0:
+        print(f"║  Limit:   {args.max_frames} frames{' '*(40-len(str(args.max_frames)))} ║")
+    print("╠" + "═"*58 + "╣")
     print("║  Constraints:                                           ║")
-    print("║    · Fixed camera (no movement)                         ║")
-    print("║    · Court visible in frame                             ║")
-    print("║    · Doubles match (4 players)                          ║")
-    print("║    · Overhand serve only                                ║")
-    print("║    · Resolution >= 720p, 30fps recommended              ║")
-    print("╚" + "═" * 58 + "╝")
+    print("║    · Fixed camera · Court visible · Doubles (4 players) ║")
+    print("║    · Overhand serve · >= 720p · 30fps recommended       ║")
+    print("╚" + "═"*58 + "╝")
 
     run_all = args.step == 0
 
-    # Step 1
     if run_all or args.step == 1:
-        if not step1(args.video, out_dir):
-            return
+        if not step1(args.video, out_dir): return
 
-    # Step 2
     if run_all or args.step == 2:
-        if not step2(args.video, out_dir):
-            if run_all:
-                print("\n  ⛔ Pipeline stopped. Complete step 2 manually, then re-run.")
-                return
+        if not step2(args.video, out_dir, args.max_frames): return
 
-    # Step 3
     if run_all or args.step == 3:
-        step3(args.video, out_dir, args.config)
+        step3(args.video, out_dir, args.config, args.max_frames)
 
-    # Step 4
     if run_all or args.step == 4:
         step4(out_dir, gru_path=args.gru)
 
-    # Step 5
     if run_all or args.step == 5:
         step5(args.video, out_dir)
 
     if run_all:
         print()
-        print("╔" + "═" * 58 + "╗")
+        print("╔" + "═"*58 + "╗")
         print("║" + "✅ Pipeline Complete!".center(58) + "║")
-        print("╠" + "═" * 58 + "╣")
-        print(f"║  Results in: {out_dir + '/':<44s} ║")
-        print("║    court_overlay.jpg  — verify court lines              ║")
-        print("║    serve_events.json  — serve timestamps                ║")
-        print("║    rally_events.json  — rally boundaries                ║")
-        print("║    rally_cuts.mp4     — rally highlight video           ║")
-        print("║    ball_positions.json — ball trajectory                ║")
-        print("╚" + "═" * 58 + "╝")
+        print("╠" + "═"*58 + "╣")
+        print(f"║  Results in: {out_dir+'/':<44s} ║")
+        for f in sorted(os.listdir(out_dir)):
+            sz = os.path.getsize(os.path.join(out_dir, f))
+            print(f"║    {f:<30s} {sz//1024:>6d} KB     ║")
+        print("╚" + "═"*58 + "╝")
 
 
 if __name__ == "__main__":
