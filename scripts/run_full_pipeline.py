@@ -89,7 +89,7 @@ def get_video_info(video_path):
 # Step 1: Court calibration
 # ============================================================
 
-def step1(video_path, out_dir):
+def step1(video_path, out_dir, weights_dir="weights"):
     print_banner(1, "Court Calibration")
     calib_path = os.path.join(out_dir, "calib.json")
     vis_path = os.path.join(out_dir, "court_overlay.jpg")
@@ -101,7 +101,8 @@ def step1(video_path, out_dir):
         import subprocess
         ret = subprocess.run([
             sys.executable, "scripts/calibrate.py", "blue-resnet",
-            "--video", video_path, "--out", calib_path, "--vis", vis_path
+            "--video", video_path, "--out", calib_path, "--vis", vis_path,
+            "--weights", os.path.join(weights_dir, "court_resnet.pth"),
         ])
         if ret.returncode != 0 or not os.path.exists(calib_path):
             print(f"  ❌ Calibration failed!")
@@ -251,7 +252,7 @@ def step2(video_path, out_dir, max_frames=0):
 # Step 3: Ball trajectory
 # ============================================================
 
-def step3(video_path, out_dir, config_path=None, max_frames=0):
+def step3(video_path, out_dir, config_path=None, max_frames=0, weights_dir="weights"):
     print_banner(3, "Ball Trajectory")
     out_path = os.path.join(out_dir, "ball_positions.json")
 
@@ -272,8 +273,9 @@ def step3(video_path, out_dir, config_path=None, max_frames=0):
     cfg = load_config(config_path) if config_path else load_config()
     bcfg, tcfg = cfg["ball"], cfg["tracker"]
 
+    ball_weights = os.path.join(weights_dir, os.path.basename(bcfg["weights"]))
     det = WASBBallDetector(WASBConfig(
-        weights=bcfg["weights"], device=BALL_DEVICE, runtime=BALL_RUNTIME,
+        weights=ball_weights, device=BALL_DEVICE, runtime=BALL_RUNTIME,
         score_threshold=bcfg.get("score_threshold", 0.5),
     ))
     tracker = MultiTrackManager(TrackerConfig(
@@ -332,7 +334,7 @@ def step3(video_path, out_dir, config_path=None, max_frames=0):
 # Step 4: Serve detection
 # ============================================================
 
-def step4(out_dir, gru_path="weights/stroke_gru_v4_best.pt"):
+def step4(out_dir, gru_path):
     print_banner(4, "Serve Detection")
     from tennisvision.action.slot_mapper import SlotMapper, SLOT_NAMES
     from tennisvision.action.gru_classifier import StrokeGRU, LABELS
@@ -501,7 +503,7 @@ def main():
     parser.add_argument("--step", type=int, default=0, help="Single step (1-5). 0=all.")
     parser.add_argument("--keypoints", default=None, help="Pre-extracted keypoints JSON")
     parser.add_argument("--config", default=None, help="YAML config for ball detector")
-    parser.add_argument("--gru", default="weights/stroke_gru_v4_best.pt")
+    parser.add_argument("--weights-dir", default="weights", help="Directory containing model weights")
     parser.add_argument("--max-frames", type=int, default=0, help="Limit frames (0=all)")
     parser.add_argument("--no-half", action="store_true", help="Disable FP16")
     args = parser.parse_args()
@@ -536,17 +538,19 @@ def main():
 
     run_all = args.step == 0
 
+    wdir = args.weights_dir
+
     if run_all or args.step == 1:
-        if not step1(args.video, out_dir): return
+        if not step1(args.video, out_dir, weights_dir=wdir): return
 
     if run_all or args.step == 2:
         if not step2(args.video, out_dir, args.max_frames): return
 
     if run_all or args.step == 3:
-        step3(args.video, out_dir, args.config, args.max_frames)
+        step3(args.video, out_dir, args.config, args.max_frames, weights_dir=wdir)
 
     if run_all or args.step == 4:
-        step4(out_dir, gru_path=args.gru)
+        step4(out_dir, gru_path=os.path.join(wdir, "stroke_gru_v4_best.pt"))
 
     if run_all or args.step == 5:
         step5(args.video, out_dir)
