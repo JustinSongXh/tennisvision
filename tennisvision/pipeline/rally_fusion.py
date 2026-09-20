@@ -71,7 +71,7 @@ class MultiSignalRallyDetector:
         for ev in serve_events:
             if cfg.serve_far_only and ev.get("slot", -1) < 2:
                 continue  # skip NEAR slots
-            valid_serves.append(ev["frame"])
+            valid_serves.append(ev.get("start_frame", ev.get("frame")))
         valid_serves = sorted(set(valid_serves))
 
         # Compute net crossings from ball positions
