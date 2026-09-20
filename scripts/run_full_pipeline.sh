@@ -141,11 +141,12 @@ if should_run 4; then
     if [[ -f "$SERVES" ]]; then
         echo "  Already exists: $SERVES"
     else
-        "$PYTHON" -u "$SCRIPTS_DIR/detect_serves.py" \
-            --keypoints "$OUT_DIR/keypoints.json" \
-            --calib "$OUT_DIR/calib.json" \
-            --gru "$WEIGHTS_DIR/stroke_gru_v4_best.pt" \
-            --out "$SERVES"
+        ARGS=(--keypoints "$OUT_DIR/keypoints.json"
+              --calib "$OUT_DIR/calib.json"
+              --gru "$WEIGHTS_DIR/stroke_gru_v4_best.pt"
+              --out "$SERVES")
+        [[ -f "$OUT_DIR/ball_positions.json" ]] && ARGS+=(--ball "$OUT_DIR/ball_positions.json")
+        "$PYTHON" -u "$SCRIPTS_DIR/detect_serves.py" "${ARGS[@]}"
     fi
 fi
 
