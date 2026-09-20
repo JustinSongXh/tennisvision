@@ -58,6 +58,10 @@ def main():
     parser.add_argument("--seq-len", type=int, default=30)
     parser.add_argument("--serve-far-only", action="store_true", default=False,
                         help="Only accept serve from FAR slots (baseline)")
+    parser.add_argument("--ball", default=None,
+                        help="ball_positions.json for ball-player distance filter")
+    parser.add_argument("--min-net-dist", type=float, default=5.0,
+                        help="Min distance from net (metres) to accept serve")
     args = parser.parse_args()
 
     # Load homography
@@ -76,6 +80,18 @@ def main():
     with open(args.keypoints) as f:
         data = json.load(f)
     print(f"  {data['total_frames']} frames, fps={data['fps']:.1f}")
+
+    # Load ball positions (optional)
+    ball_det, ball_pred = {}, {}
+    if args.ball:
+        print(f"Loading ball: {args.ball}")
+        with open(args.ball) as f:
+            ball_data = json.load(f)
+        ball_det = ball_data.get("detected", {})
+        ball_pred = ball_data.get("predicted", {})
+        print(f"  {len(ball_det)} detected, {len(ball_pred)} predicted")
+
+    img_w = data.get("width", 1920)
 
     # Load GRU
     print(f"Loading GRU: {args.gru}")
@@ -189,6 +205,70 @@ def main():
             "slot_name": SLOT_NAMES[cur_slot],
             "conf": round(cur_conf, 3),
         })
+
+    # Post-merge filtering
+    def _get_ball(frame_idx):
+        k = str(frame_idx)
+        pos = ball_det.get(k) or ball_pred.get(k)
+        return pos
+
+    def _filter_serve(ev):
+        mid_frame = (ev["start_frame"] + ev["end_frame"]) // 2
+        fd = data["frames"][mid_frame]
+        slot = ev["slot"]
+
+        # Find the player assigned to this slot
+        slot_dets = mapper.assign(fd["detections"])
+        if slot not in slot_dets:
+            return True, ""  # can't verify, keep it
+        det = slot_dets[slot]
+        foot_x, foot_y = det["foot_x"], det["foot_y"]
+
+        # 1. Net proximity: too close to net → not a serve
+        rx, ry = mapper.to_court(foot_x, foot_y)
+        if rx is not None and ry is not None:
+            dist_net = abs(ry - mapper.net_y_m)
+            if dist_net < args.min_net_dist:
+                return False, f"too close to net ({dist_net:.1f}m)"
+
+        # 2. Sideline: outside court width → not a serve
+        if rx is not None:
+            if rx < -1.0 or rx > mapper.cfg.court_width_m + 1.0:
+                return False, f"outside sideline (rx={rx:.1f}m)"
+
+        # 3. Frame edge: bbox touching left/right edge → incomplete body
+        bbox = det["bbox"]
+        if bbox[0] <= 1 or bbox[2] >= img_w - 1:
+            return False, "frame edge (incomplete body)"
+
+        # 4. Ball x-proximity: check a window around the event,
+        #    if ball is detected in any frame near the player → keep
+        #    (GRU reports serve after the motion, so ball may have left by mid_frame)
+        if ball_det or ball_pred:
+            search_start = max(0, ev["start_frame"] - int(data["fps"]))
+            search_end = ev["end_frame"] + 1
+            min_x_diff = float("inf")
+            for check_fi in range(search_start, search_end):
+                bp = _get_ball(check_fi)
+                if bp is not None:
+                    diff = abs(bp[0] - foot_x)
+                    if diff < min_x_diff:
+                        min_x_diff = diff
+            if min_x_diff < float("inf"):
+                bbox_w = bbox[2] - bbox[0]
+                if min_x_diff > max(bbox_w * 5, 300):
+                    return False, f"ball x too far (min_diff={min_x_diff:.0f}px)"
+
+        return True, ""
+
+    filtered_serves = []
+    for ev in merged_serves:
+        keep, reason = _filter_serve(ev)
+        if keep:
+            filtered_serves.append(ev)
+        else:
+            print(f"  Filtered: {ev['start_time']}s {ev['slot_name']} - {reason}")
+    merged_serves = filtered_serves
 
     # Print results
     print(f"\nGRU invocations: {gru_count}")
