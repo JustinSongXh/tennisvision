@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Detect rallies from serve events + ball trajectory + keypoints.
+"""Detect rallies from serve events + ball trajectory.
 
-Reads intermediate results (calib, keypoints, ball, serves) from a results
-directory and produces rally_events.json + rally_cuts.mp4.
+Uses three rally end conditions:
+  1. No net crossing timeout (5s default)
+  2. Next serve event
+  3. Double bounce in same half court
 
 Usage:
     python -u scripts/detect_rallies.py \
@@ -63,14 +65,19 @@ def main():
         kp_meta = json.load(f)
     fps, total_frames = kp_meta["fps"], kp_meta["total_frames"]
 
-    # Load ball positions (optional)
+    # Load ball positions
     ball_path = os.path.join(rdir, "ball_positions.json")
-    ball_positions = {}
+    ball_all = {}
+    ball_det = {}
     if os.path.exists(ball_path):
         with open(ball_path) as f:
             bp = json.load(f)
-        ball_positions = {int(k): tuple(v) for k, v in bp.get("predicted", {}).items()}
-        print(f"Ball positions: {len(ball_positions)} frames")
+        ball_all = {int(k): tuple(v) for k, v in bp.get("predicted", {}).items()}
+        # Merge detected into all (detected takes priority)
+        for k, v in bp.get("detected", {}).items():
+            ball_all[int(k)] = tuple(v)
+        ball_det = {int(k): tuple(v) for k, v in bp.get("detected", {}).items()}
+        print(f"Ball positions: {len(ball_all)} total, {len(ball_det)} detected")
     else:
         print("No ball trajectory found, continuing without")
 
@@ -85,7 +92,8 @@ def main():
         min_duration_s=args.min_duration,
     ))
     rallies = detector.detect(total_frames, fps, serve_events=serves,
-                              ball_positions=ball_positions, net_y_px=net_y_px)
+                              ball_positions=ball_all, ball_detected=ball_det,
+                              net_y_px=net_y_px, H_img_to_real=H)
 
     # Save rally JSON
     rally_json = os.path.join(rdir, "rally_events.json")
