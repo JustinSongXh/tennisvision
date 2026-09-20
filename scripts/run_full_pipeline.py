@@ -33,6 +33,12 @@ import shutil
 import subprocess
 import sys
 
+try:
+    import torch
+    _HAS_CUDA = torch.cuda.is_available()
+except ImportError:
+    _HAS_CUDA = False
+
 
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -112,6 +118,7 @@ def step3(video_path, out_dir, weights_dir, config_path, max_frames):
         "--video", video_path,
         "--out", out_path,
         "--weights", os.path.join(weights_dir, "wasb_tennis_best.pth.tar"),
+        "--device", "cuda" if _HAS_CUDA else "cpu",
     ]
     if config_path:
         args += ["--config", config_path]
