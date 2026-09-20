@@ -56,7 +56,7 @@ def main():
     parser.add_argument("--serve-threshold", type=float, default=0.8)
     parser.add_argument("--gap-tolerance", type=int, default=5)
     parser.add_argument("--seq-len", type=int, default=30)
-    parser.add_argument("--serve-far-only", action="store_true", default=True,
+    parser.add_argument("--serve-far-only", action="store_true", default=False,
                         help="Only accept serve from FAR slots (baseline)")
     args = parser.parse_args()
 
