@@ -801,28 +801,38 @@ def write_rally_video(
     tail_frames = max(0, int(round(extra_tail_seconds * fps)))
     blank = np.zeros((H, W, 3), dtype=np.uint8)
 
+    # Build frame ranges needed per rally (sorted by start)
+    clips = []
     for r in rallies:
-        text = "Rally %d  (%.1fs)" % (
-            r.idx + 1, (r.end_frame - r.start_frame + 1) / max(fps, 1.0))
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 2.0, 4)
-        title = blank.copy()
-        cv2.putText(title, text, ((W - tw) // 2, (H + th) // 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 2.0, (255, 255, 255), 4)
-        for _ in range(sep_frames):
-            writer.write(title)
-
-        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, r.start_frame - 1))
         clip_end = r.end_frame + tail_frames
         if total_src_frames > 0:
-            clip_end = min(clip_end, total_src_frames)
-        n_needed = clip_end - r.start_frame + 1
-        n_read = 0
-        while n_read < n_needed:
-            ret, frame = cap.read()
-            if not ret:
-                break
+            clip_end = min(clip_end, total_src_frames - 1)
+        clips.append((r, r.start_frame, clip_end))
+
+    # Sequential read — no seeking, accurate on all codecs
+    max_frame_needed = max(ce for _, _, ce in clips)
+    clip_idx = 0
+    fi = 0
+    while fi <= max_frame_needed and clip_idx < len(clips):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        # Write title card just before we reach the next rally
+        r, clip_start, clip_end = clips[clip_idx]
+        if fi == clip_start:
+            text = "Rally %d  (%.1fs)" % (
+                r.idx + 1, (r.end_frame - r.start_frame + 1) / max(fps, 1.0))
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 2.0, 4)
+            title = blank.copy()
+            cv2.putText(title, text, ((W - tw) // 2, (H + th) // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 2.0, (255, 255, 255), 4)
+            for _ in range(sep_frames):
+                writer.write(title)
+        if clip_start <= fi <= clip_end:
             writer.write(frame)
-            n_read += 1
+        if fi >= clip_end:
+            clip_idx += 1
+        fi += 1
     cap.release()
     writer.release()
 
