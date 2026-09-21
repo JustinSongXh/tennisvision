@@ -96,6 +96,7 @@ class MultiSignalRallyDetector:
             rally_end, end_reason = self._find_rally_end(
                 serve_frame, next_serve_frame, total_frames, fps,
                 ball, net_y_px, double_bounce_set, cfg,
+                ball_detected=ball_det,
             )
 
             rally_end = min(rally_end, total_frames - 1)
@@ -143,12 +144,14 @@ class MultiSignalRallyDetector:
         net_y_px: Optional[float],
         double_bounce_set: set,
         cfg: FusionRallyConfig,
+        ball_detected: Optional[Dict[int, Tuple[float, float]]] = None,
     ) -> Tuple[int, str]:
         timeout_frames = int(round(cfg.no_cross_timeout_s * fps))
         buffer_frames = int(round(cfg.no_cross_buffer_s * fps))
         skip_start = serve_frame + int(cfg.bounce_skip_start_s * fps)
+        det = ball_detected or {}
 
-        prev_y = None
+        prev_det_y = None
         last_crossing = serve_frame
 
         for fi in range(serve_frame, min(total_frames, next_serve_frame)):
@@ -156,19 +159,22 @@ class MultiSignalRallyDetector:
             if fi in double_bounce_set and fi > skip_start:
                 return fi + int(fps), "double bounce"
 
-            # Ball tracking for net crossings
+            # Ball presence check (detected + predicted)
             pos = ball.get(fi)
             if pos is None:
                 if (fi - last_crossing) > timeout_frames:
                     return last_crossing + buffer_frames, "no crossing timeout"
                 continue
 
-            by = pos[1]
-            if net_y_px is not None and prev_y is not None:
-                if (prev_y < net_y_px and by >= net_y_px) or \
-                   (prev_y >= net_y_px and by < net_y_px):
+            # Net crossing: only from detected positions (not Kalman predictions)
+            det_pos = det.get(fi)
+            if det_pos is not None and net_y_px is not None and prev_det_y is not None:
+                by = det_pos[1]
+                if (prev_det_y < net_y_px and by >= net_y_px) or \
+                   (prev_det_y >= net_y_px and by < net_y_px):
                     last_crossing = fi
-            prev_y = by
+            if det_pos is not None:
+                prev_det_y = det_pos[1]
 
             # Rule 1: no crossing timeout
             if (fi - last_crossing) > timeout_frames:
