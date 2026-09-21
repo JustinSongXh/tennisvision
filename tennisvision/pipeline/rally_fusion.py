@@ -74,6 +74,15 @@ class MultiSignalRallyDetector:
             double_bounce_set = self._find_double_bounces(bounces, fps, cfg)
             print(f"Bounces: {len(bounces)}, double bounces: {len(double_bounce_set)}")
 
+        # --- Net x-range in pixels (for filtering off-court crossings) ---
+        net_x_range = None
+        if H_img_to_real is not None:
+            H_inv = np.linalg.inv(H_img_to_real)
+            margin = 2.0  # meters outside court to allow (for outside-in shots)
+            p_left = H_inv @ [-margin, 23.77 / 2, 1.0]
+            p_right = H_inv @ [10.97 + margin, 23.77 / 2, 1.0]
+            net_x_range = (p_left[0] / p_left[2], p_right[0] / p_right[2])
+
         # --- Build rallies ---
         rallies = []
         pre_roll = int(round(cfg.pre_roll_s * fps))
@@ -96,7 +105,7 @@ class MultiSignalRallyDetector:
             rally_end, end_reason = self._find_rally_end(
                 serve_frame, next_serve_frame, total_frames, fps,
                 ball, net_y_px, double_bounce_set, cfg,
-                ball_detected=ball_det,
+                ball_detected=ball_det, net_x_range=net_x_range,
             )
 
             rally_end = min(rally_end, total_frames - 1)
@@ -145,11 +154,13 @@ class MultiSignalRallyDetector:
         double_bounce_set: set,
         cfg: FusionRallyConfig,
         ball_detected: Optional[Dict[int, Tuple[float, float]]] = None,
+        net_x_range: Optional[Tuple[float, float]] = None,
     ) -> Tuple[int, str]:
         timeout_frames = int(round(cfg.no_cross_timeout_s * fps))
         buffer_frames = int(round(cfg.no_cross_buffer_s * fps))
         skip_start = serve_frame + int(cfg.bounce_skip_start_s * fps)
         det = ball_detected or {}
+        x_lo, x_hi = net_x_range if net_x_range else (0.0, 1e9)
 
         prev_det_y = None
         last_crossing = serve_frame
@@ -169,10 +180,11 @@ class MultiSignalRallyDetector:
             # Net crossing: only from detected positions (not Kalman predictions)
             det_pos = det.get(fi)
             if det_pos is not None and net_y_px is not None and prev_det_y is not None:
-                by = det_pos[1]
+                bx, by = det_pos[0], det_pos[1]
                 if (prev_det_y < net_y_px and by >= net_y_px) or \
                    (prev_det_y >= net_y_px and by < net_y_px):
-                    last_crossing = fi
+                    if x_lo <= bx <= x_hi:  # ball within court x-range
+                        last_crossing = fi
             if det_pos is not None:
                 prev_det_y = det_pos[1]
 
