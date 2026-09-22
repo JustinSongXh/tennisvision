@@ -2,18 +2,25 @@
 
 ## Project overview
 
-Tennis video analysis pipeline: ball detection & tracking, bounce detection, rally segmentation, player pose estimation & stroke classification, and annotated video rendering. Single fixed-camera input, outputs annotated video + rally cuts + JSON stats.
+Tennis video analysis pipeline: court calibration, ball detection & tracking, player pose extraction, serve detection, rally segmentation, and optional annotated video rendering. Single fixed-camera input, outputs structured JSON + rally cut videos.
 
 ## Repository layout
 
 ```
-scripts/          CLI entry points (analyze.py, calibrate.py, diagnose.py)
+scripts/          CLI entry points
+  run_full_pipeline.py   5-step orchestrator (primary workflow)
+  calibrate.py           Court calibration
+  extract_keypoints.py   Player detection + pose (yolo11m + yolo26s-pose)
+  extract_ball_positions.py  Ball detection + Kalman tracker (WASB HRNet)
+  detect_serves.py       GRU v4 serve classification
+  detect_rallies.py      Rally fusion + video cutting
+  analyze.py             Integrated two-pass pipeline (with rendering)
 tennisvision/     Main package
   ball/           Ball detection (WASB HRNet, classical HSV) + Kalman tracker + InpaintNet
   bounce/         Bounce detection (CatBoost, peak)
   court/          Court detection, homography, calibration
-  action/         Player pose (YOLO-pose) + stroke classifier (GRU)
-  pipeline/       Two-pass orchestration + rally state machine
+  action/         Player pose (YOLO-pose) + slot mapper + GRU classifier
+  pipeline/       Two-pass orchestration + rally state machines (rally.py, rally_fusion.py)
   render/         Trail, minimap, HUD, player overlay
 configs/          YAML config overrides (local_run, remote_inpaint, etc.)
 weights/          Model checkpoints (gitignored — download separately)
@@ -41,7 +48,14 @@ docs/             Design docs and surveys
 
 ### Running the pipeline
 
-Local (Mac, venv):
+Standalone 5-step pipeline (primary):
+```bash
+python scripts/run_full_pipeline.py \
+    --video samples/sample2.mp4 \
+    --weights-dir weights/
+```
+
+Integrated two-pass pipeline (with rendering):
 ```bash
 cd /Users/justinsong/WorkSpace/solo/tennisvision && \
 /Users/justinsong/WorkSpace/solo/venv/bin/python -u scripts/analyze.py \
@@ -50,25 +64,23 @@ cd /Users/justinsong/WorkSpace/solo/tennisvision && \
     --out /Users/justinsong/WorkSpace/solo/results/<name>.mp4
 ```
 
-Remote (192.168.196.196, GPU):
+Remote (10.13.9.247, GPU):
 ```bash
-ssh 192.168.196.196
-cd /root/personal/tennisvision
-python -u scripts/analyze.py \
-    --video /root/personal/<video>.mp4 \
-    --calib /root/personal/<calib>.json \
-    --config configs/remote_inpaint.yaml \
-    --out /root/personal/results/<name>.mp4
+ssh root@10.13.9.247
+cd /root/solo/tennisvision
+python -u scripts/run_full_pipeline.py \
+    --video /root/solo/samples/<video>.mp4 \
+    --weights-dir /root/solo/weights/
 ```
 
 For long runs use `nohup ... > log 2>&1 &` and `caffeinate -i -s -w <PID> &` locally.
 
 ### Test videos
-- `tennis_raw.mp4` — singles, use `calib.json`
-- `tennis_raw2.mp4` — doubles (4 players), use `calib2.json`
+- `sample2.mp4` — doubles (4 players), use `results/sample2/calib.json`
+- `sample3.mp4` — TBD
 
 ### Remote machine notes
-- Weights live at `/root/personal/` (outside repo tree), scp from local `./weights/`.
+- Weights live at `/root/solo/` (outside repo tree), scp from local `./weights/`.
 - `pip install --break-system-packages` is pre-authorized on the remote.
 - Proxy for downloads: `export https_proxy=http://10.13.11.1:1080`.
 - After installing ultralytics: `pip install --force-reinstall opencv-python-headless`.
@@ -76,11 +88,24 @@ For long runs use `nohup ... > log 2>&1 &` and `caffeinate -i -s -w <PID> &` loc
 ## Config system
 
 Defaults in `tennisvision/config.py` DEFAULTS dict. Override via YAML files in `configs/`. Key switches:
-- `action.enabled: true` — enables Pass 1b (pose + stroke classification)
+- `action.enabled: true` — enables Pass 1b (pose + stroke classification) in analyze.py
 - `rally.online: false` — default offline two-pass mode
 - `inpainter.enabled: false` — trajectory gap-filling (optional)
+- `ball.two_stage: true` — two-stage ball detection (main + far-court crop)
 
-## Architecture: two-pass pipeline
+## Architecture
+
+### Standalone pipeline (run_full_pipeline.py)
+
+```
+Step 1: calibrate.py        → calib.json (court homography)
+Step 2: extract_keypoints.py → keypoints.json (player pose per frame)
+Step 3: extract_ball_positions.py → ball_positions.json (ball trajectory)
+Step 4: detect_serves.py    → serve_events.json (GRU v4 + filtering)
+Step 5: detect_rallies.py   → rally_events.json + rally_cuts.mp4
+```
+
+### Integrated pipeline (analyze.py)
 
 ```
 Pass 1a: ball detection -> Kalman tracker -> online rally detector
@@ -88,3 +113,16 @@ Pass 1a: ball detection -> Kalman tracker -> online rally detector
 Pass 1b: per-rally pose estimation -> stroke classification (only if action.enabled)
 Pass 2:  re-read video -> render overlays -> write annotated output + rally cuts + JSON
 ```
+
+## Model weights
+
+| File | Module | Notes |
+|------|--------|-------|
+| `court_resnet.pth` | Court calibration | ResNet50, 14-point regression |
+| `wasb_tennis_best.pth.tar` | Ball detection | WASB HRNet, auto-exports .onnx |
+| `stroke_gru_v4_best.pt` | Serve detection | GRU v4, 4-class (standalone pipeline) |
+| `bounce_catboost.cbm` | Bounce detection | CatBoost classifier |
+| `yolo26s-pose.pt` | Keypoint extraction | YOLO26s-pose (standalone pipeline) |
+| `yolo26n-pose.pt` | Player pose | YOLO26n-pose (analyze.py pipeline) |
+| `tennis_rnn.h5` | Stroke classification | Keras GRU (analyze.py pipeline) |
+| `InpaintNet_best.pt` | Trajectory inpainting | TrackNetV3, optional |
