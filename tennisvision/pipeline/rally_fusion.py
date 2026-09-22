@@ -68,11 +68,14 @@ class MultiSignalRallyDetector:
 
         # --- Detect bounces + triple bounces ---
         triple_bounce_set = set()
+        bounces = []
         if ball_det and H_img_to_real is not None:
             bounces = self._detect_bounces(ball, ball_det, total_frames, fps,
                                            H_img_to_real, cfg)
             triple_bounce_set = self._find_triple_bounces(bounces, fps, cfg)
             print(f"Bounces: {len(bounces)}, triple bounces: {len(triple_bounce_set)}")
+        # Store for caller: list of (frame, half, rx, ry)
+        self.bounces = bounces
 
         # --- Net x-range in pixels (for filtering off-court crossings) ---
         net_x_range = None
@@ -261,14 +264,14 @@ class MultiSignalRallyDetector:
                 continue
 
             half = "NEAR" if ry < net_y_court else "FAR"
-            raw.append((ci_abs, score, half))
+            raw.append((ci_abs, score, half, rx, ry))
 
         # Dedupe by confidence
         bounces = []
-        for frame, score, half in sorted(raw, key=lambda x: -x[1]):
-            if any(abs(frame - f) < min_gap_frames for f, _ in bounces):
+        for frame, score, half, rx, ry in sorted(raw, key=lambda x: -x[1]):
+            if any(abs(frame - f) < min_gap_frames for f, _, _, _ in bounces):
                 continue
-            bounces.append((frame, half))
+            bounces.append((frame, half, rx, ry))
         bounces.sort(key=lambda x: x[0])
         return bounces
 
@@ -347,9 +350,9 @@ class MultiSignalRallyDetector:
         window_frames = cfg.triple_bounce_window_s * fps
         triple_set = set()
         for i in range(2, len(bounces)):
-            f0, h0 = bounces[i - 2]
-            f1, h1 = bounces[i - 1]
-            f2, h2 = bounces[i]
+            f0, h0 = bounces[i - 2][0], bounces[i - 2][1]
+            f1, h1 = bounces[i - 1][0], bounces[i - 1][1]
+            f2, h2 = bounces[i][0], bounces[i][1]
             if h0 == h1 == h2 and (f2 - f0) < window_frames:
                 triple_set.add(f2)
         return triple_set

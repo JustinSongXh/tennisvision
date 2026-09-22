@@ -762,6 +762,7 @@ def write_rally_video(
     separator_seconds: float = 1.0,
     extra_tail_seconds: float = 0.0,
     fourcc: str = "mp4v",
+    bounces: Optional[list] = None,
 ) -> None:
     """Copy each rally's frames from `src_video` to `dst_video`, with a
     short black 'Rally N' title between them.
@@ -801,6 +802,12 @@ def write_rally_video(
     tail_frames = max(0, int(round(extra_tail_seconds * fps)))
     blank = np.zeros((H, W, 3), dtype=np.uint8)
 
+    # Minimap setup
+    minimap = None
+    if bounces:
+        from ..render.minimap import Minimap, MinimapConfig
+        minimap = Minimap(MinimapConfig())
+
     # Build frame ranges needed per rally (sorted by start)
     clips = []
     for r in rallies:
@@ -829,6 +836,13 @@ def write_rally_video(
             for _ in range(sep_frames):
                 writer.write(title)
         if clip_start <= fi <= clip_end:
+            # Overlay minimap with bounce dots
+            if minimap is not None:
+                rally_bounces = [
+                    b for b in bounces
+                    if clip_start <= b[2] <= fi
+                ]
+                minimap.overlay(frame, rally_bounces, fi)
             writer.write(frame)
         if fi >= clip_end:
             clip_idx += 1

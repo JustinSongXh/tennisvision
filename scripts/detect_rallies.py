@@ -103,8 +103,11 @@ def main():
     rally_video = os.path.join(rdir, "rally_cuts.mp4")
     if rallies:
         print("Writing rally video...")
+        # Bounces as (rx, ry, frame) for minimap
+        bounce_dots = [(rx, ry, f) for f, _, rx, ry in detector.bounces]
         write_rally_video(args.video, rallies, rally_video,
-                          separator_seconds=1.0, extra_tail_seconds=2.0)
+                          separator_seconds=1.0, extra_tail_seconds=2.0,
+                          bounces=bounce_dots)
 
     print(f"\n{len(rallies)} rallies:")
     for r in rallies:
