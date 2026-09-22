@@ -31,7 +31,7 @@ class FusionRallyConfig:
     pre_roll_s: float = 1.0
     min_duration_s: float = 2.0
     serve_dedup_s: float = 10.0          # merge consecutive serves within this window
-    double_bounce_gap_s: float = 1.5     # max gap between bounces for double bounce
+    triple_bounce_window_s: float = 2.0  # 3 bounces on same half within this window
     bounce_skip_start_s: float = 1.0     # skip bounces in first N seconds of rally
     # Bounce scoring (Good-Tennis style)
     bounce_window: int = 20
@@ -66,13 +66,13 @@ class MultiSignalRallyDetector:
         deduped = self._dedup_serves(serve_events, cfg.serve_dedup_s)
         print(f"Serves: {len(serve_events)} total, {len(deduped)} deduped")
 
-        # --- Detect bounces + double bounces ---
-        double_bounce_set = set()
+        # --- Detect bounces + triple bounces ---
+        triple_bounce_set = set()
         if ball_det and H_img_to_real is not None:
             bounces = self._detect_bounces(ball, ball_det, total_frames, fps,
                                            H_img_to_real, cfg)
-            double_bounce_set = self._find_double_bounces(bounces, fps, cfg)
-            print(f"Bounces: {len(bounces)}, double bounces: {len(double_bounce_set)}")
+            triple_bounce_set = self._find_triple_bounces(bounces, fps, cfg)
+            print(f"Bounces: {len(bounces)}, triple bounces: {len(triple_bounce_set)}")
 
         # --- Net x-range in pixels (for filtering off-court crossings) ---
         net_x_range = None
@@ -104,7 +104,7 @@ class MultiSignalRallyDetector:
             # Find rally end
             rally_end, end_reason = self._find_rally_end(
                 serve_frame, next_serve_frame, total_frames, fps,
-                ball, net_y_px, double_bounce_set, cfg,
+                ball, net_y_px, triple_bounce_set, cfg,
                 ball_detected=ball_det, net_x_range=net_x_range,
             )
 
@@ -151,7 +151,7 @@ class MultiSignalRallyDetector:
         fps: float,
         ball: Dict[int, Tuple[float, float]],
         net_y_px: Optional[float],
-        double_bounce_set: set,
+        triple_bounce_set: set,
         cfg: FusionRallyConfig,
         ball_detected: Optional[Dict[int, Tuple[float, float]]] = None,
         net_x_range: Optional[Tuple[float, float]] = None,
@@ -166,9 +166,9 @@ class MultiSignalRallyDetector:
         last_crossing = serve_frame
 
         for fi in range(serve_frame, min(total_frames, next_serve_frame)):
-            # Rule 3: double bounce
-            if fi in double_bounce_set and fi > skip_start:
-                return fi + int(fps), "double bounce"
+            # Rule 3: triple bounce (same half, 3 bounces within window)
+            if fi in triple_bounce_set and fi > skip_start:
+                return fi + int(fps), "triple bounce"
 
             # Ball presence check (detected + predicted)
             pos = ball.get(fi)
@@ -342,16 +342,17 @@ class MultiSignalRallyDetector:
                 + 0.10 * (1.0 if y_extreme else 0.0))
 
     @staticmethod
-    def _find_double_bounces(bounces: List[Tuple[int, str]], fps: float,
+    def _find_triple_bounces(bounces: List[Tuple[int, str]], fps: float,
                              cfg: FusionRallyConfig) -> set:
-        gap_frames = cfg.double_bounce_gap_s * fps
-        double_set = set()
-        for i in range(1, len(bounces)):
+        window_frames = cfg.triple_bounce_window_s * fps
+        triple_set = set()
+        for i in range(2, len(bounces)):
+            f0, h0 = bounces[i - 2]
             f1, h1 = bounces[i - 1]
             f2, h2 = bounces[i]
-            if h1 == h2 and (f2 - f1) < gap_frames:
-                double_set.add(f2)
-        return double_set
+            if h0 == h1 == h2 and (f2 - f0) < window_frames:
+                triple_set.add(f2)
+        return triple_set
 
     # ------------------------------------------------------------------
     # Trajectory preprocessing

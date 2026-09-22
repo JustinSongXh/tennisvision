@@ -4,7 +4,7 @@
 Uses three rally end conditions:
   1. No net crossing timeout (5s default)
   2. Next serve event
-  3. Double bounce in same half court
+  3. Triple bounce in same half court (within 2s window)
 
 Usage:
     python -u scripts/detect_rallies.py \
