@@ -28,6 +28,7 @@ import json
 import os
 import sys
 
+import cv2
 import numpy as np
 import torch
 
@@ -51,6 +52,8 @@ def main():
     parser.add_argument("--gru", default="weights/stroke_gru_v4_best.pt")
     parser.add_argument("--calib", default=None,
                         help="calib.json with H_img_to_real (omit to use hardcoded fallback)")
+    parser.add_argument("--video", default=None,
+                        help="Original video for serve_review.mp4 clip generation")
     parser.add_argument("--out", required=True)
     parser.add_argument("--speed-threshold", type=float, default=0.15)
     parser.add_argument("--serve-threshold", type=float, default=0.8)
@@ -60,7 +63,7 @@ def main():
                         help="Only accept serve from FAR slots (baseline)")
     parser.add_argument("--ball", default=None,
                         help="ball_positions.json for ball-player distance filter")
-    parser.add_argument("--min-net-dist", type=float, default=5.0,
+    parser.add_argument("--min-net-dist", type=float, default=8.0,
                         help="Min distance from net (metres) to accept serve")
     args = parser.parse_args()
 
@@ -259,6 +262,44 @@ def main():
                 if min_x_diff > max(bbox_w * 5, 300):
                     return False, f"ball x too far (min_diff={min_x_diff:.0f}px)"
 
+        # 5. Ball toss check: serve requires upward ball motion (y decreasing)
+        #    in a ±0.5s window around the event start, ball must be near the player
+        if ball_det or ball_pred:
+            fps = data["fps"]
+            half_win = int(round(0.5 * fps))
+            toss_start = max(0, ev["start_frame"] - half_win)
+            toss_end = ev["start_frame"] + half_win
+            bbox_w = bbox[2] - bbox[0]
+            bbox_h = bbox[3] - bbox[1]
+            max_ball_dist_x = max(bbox_w * 3, 200)
+            max_ball_dist_y = max(bbox_h * 3, 200)
+            ys = []
+            for check_fi in range(toss_start, toss_end + 1):
+                bp = _get_ball(check_fi)
+                if bp is None:
+                    continue
+                if abs(bp[0] - foot_x) > max_ball_dist_x:
+                    continue
+                if abs(bp[1] - foot_y) > max_ball_dist_y:
+                    continue
+                ys.append(bp[1])
+            # Look for any sustained upward segment (y decreasing over >=4 consecutive frames)
+            has_toss = False
+            if len(ys) >= 4:
+                streak = 0
+                for i in range(1, len(ys)):
+                    if ys[i] < ys[i - 1] - 2:  # ball moving up by >2px
+                        streak += 1
+                        if streak >= 3:
+                            has_toss = True
+                            break
+                    else:
+                        streak = 0
+            if not ys:
+                return False, "no ball near player in toss window"
+            if not has_toss:
+                return False, "no ball toss (no upward trajectory)"
+
         return True, ""
 
     filtered_serves = []
@@ -303,6 +344,59 @@ def main():
     with open(args.out, "w") as f:
         json.dump(output, f, indent=2)
     print(f"\nSaved: {args.out}")
+
+    # Generate serve_review.mp4
+    if args.video and merged_serves:
+        review_path = os.path.join(os.path.dirname(args.out) or ".", "serve_review.mp4")
+        print(f"\nGenerating serve review: {review_path}")
+        _write_serve_review(args.video, merged_serves, data["fps"], review_path)
+
+
+def _write_serve_review(src_video, serves, fps, dst_video, pad_seconds=0.5):
+    cap = cv2.VideoCapture(src_video)
+    if not cap.isOpened():
+        raise SystemExit("cannot open " + src_video)
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    pad = int(round(pad_seconds * fps))
+
+    os.makedirs(os.path.dirname(dst_video) or ".", exist_ok=True)
+    writer = cv2.VideoWriter(dst_video, cv2.VideoWriter_fourcc(*"mp4v"),
+                             fps, (W, H))
+    if not writer.isOpened():
+        cap.release()
+        raise SystemExit("cannot open writer for " + dst_video)
+
+    # Build clip ranges
+    clips = []
+    for i, ev in enumerate(serves):
+        clip_start = max(0, ev["start_frame"] - pad)
+        clip_end = min(total - 1, ev["end_frame"] + pad)
+        clips.append((i, ev, clip_start, clip_end))
+
+    # Sequential read
+    max_needed = max(ce for _, _, _, ce in clips)
+    clip_idx = 0
+    fi = 0
+    while fi <= max_needed and clip_idx < len(clips):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        idx, ev, clip_start, clip_end = clips[clip_idx]
+        if clip_start <= fi <= clip_end:
+            label = "Serve %d/%d  %s  conf=%.2f  t=%.1fs" % (
+                idx + 1, len(serves), ev["slot_name"], ev["conf"], fi / fps)
+            cv2.putText(frame, label, (20, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+            writer.write(frame)
+            if fi == clip_end:
+                clip_idx += 1
+        fi += 1
+
+    cap.release()
+    writer.release()
+    print(f"  Saved: {dst_video} ({len(clips)} clips)")
 
 
 if __name__ == "__main__":
