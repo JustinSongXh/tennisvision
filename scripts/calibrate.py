@@ -309,6 +309,143 @@ def cmd_tcd(args):
         print("wrote", args.vis)
 
 
+def cmd_click(args):
+    """Interactive calibration: click court keypoints on a video frame.
+
+    10 points offered in order (right-click to skip):
+      Doubles corners:  FL(0), FR(1), NR(2), NL(3)
+      Singles corners:  FLs(4), FRs(5), NRs(6), NLs(7)
+      Net x Singles:    net-left(4s), net-right(5s)
+    Minimum 4 points required. More points = more accurate.
+    """
+    cap = cv2.VideoCapture(args.video)
+    if not cap.isOpened():
+        raise SystemExit("cannot open " + args.video)
+    if args.frame > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, args.frame)
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
+        raise SystemExit("cannot read frame %d" % args.frame)
+
+    # (keypoint_id, name, real_coord_m)
+    # Net x singles intersections are not in the standard 14-point set,
+    # so we define their real coords inline.
+    W, L, s = ref.COURT_WIDTH_M, ref.COURT_LENGTH_M, ref.SINGLES_INSET
+    NET_Y = L / 2.0
+    POINTS = [
+        (0,  "FL  (far-left doubles)",     ref.KEYPOINTS_M[0]),
+        (1,  "FR  (far-right doubles)",    ref.KEYPOINTS_M[1]),
+        (2,  "NR  (near-right doubles)",   ref.KEYPOINTS_M[2]),
+        (3,  "NL  (near-left doubles)",    ref.KEYPOINTS_M[3]),
+        (4,  "FLs (far-left singles)",     ref.KEYPOINTS_M[4]),
+        (5,  "FRs (far-right singles)",    ref.KEYPOINTS_M[5]),
+        (6,  "NRs (near-right singles)",   ref.KEYPOINTS_M[6]),
+        (7,  "NLs (near-left singles)",    ref.KEYPOINTS_M[7]),
+        (-1, "Net x left singles line",    (s, NET_Y)),
+        (-2, "Net x right singles line",   (W - s, NET_Y)),
+    ]
+
+    marked = {}   # index -> (x, y)
+    cur = [0]     # current point index
+
+    def _draw():
+        vis = frame.copy()
+        # Draw marked points
+        for idx, (x, y) in marked.items():
+            cv2.circle(vis, (int(x), int(y)), 5, (0, 255, 0), -1)
+            cv2.circle(vis, (int(x), int(y)), 5, (255, 255, 255), 1)
+            label = POINTS[idx][1].split("(")[0].strip()
+            cv2.putText(vis, label, (int(x) + 8, int(y) - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        # HUD bar
+        bar_h = 45
+        vis[:bar_h, :] = (vis[:bar_h, :].astype(np.float32) * 0.3).astype(np.uint8)
+        ci = cur[0]
+        if ci < len(POINTS):
+            txt = "Click: %s  |  S: skip  |  ENTER: done  |  ESC: cancel" % POINTS[ci][1]
+            cv2.putText(vis, txt, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        else:
+            txt = "%d/%d points marked.  ENTER: confirm  |  ESC: cancel" % (len(marked), len(POINTS))
+            cv2.putText(vis, txt, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        return vis
+
+    def on_mouse(event, x, y, flags, param):
+        ci = cur[0]
+        if ci >= len(POINTS):
+            return
+        if event == cv2.EVENT_LBUTTONDOWN:
+            marked[ci] = (float(x), float(y))
+            print("  Marked %s: (%d, %d)" % (POINTS[ci][1], x, y))
+            cur[0] += 1
+            cv2.imshow(win, _draw())
+
+    win = "Court Calibration"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win, min(frame.shape[1], 1600), min(frame.shape[0], 900))
+    cv2.setMouseCallback(win, on_mouse)
+    cv2.imshow(win, _draw())
+
+    while True:
+        key = cv2.waitKey(50) & 0xFF
+        if key == 27:
+            cv2.destroyAllWindows()
+            raise SystemExit("Cancelled")
+        if key in (ord('s'), ord('S')) and cur[0] < len(POINTS):
+            print("  Skipped %s" % POINTS[cur[0]][1])
+            cur[0] += 1
+            cv2.imshow(win, _draw())
+        if key in (13, 10):  # Enter
+            break
+
+    cv2.destroyAllWindows()
+
+    if len(marked) < 4:
+        raise SystemExit("Only %d points marked, need at least 4" % len(marked))
+
+    # Build homography from marked points
+    src_pts, dst_pts = [], []
+    for idx, (x, y) in marked.items():
+        src_pts.append([x, y])
+        dst_pts.append(POINTS[idx][2])
+
+    src = np.array(src_pts, dtype=np.float32)
+    dst = np.array(dst_pts, dtype=np.float32)
+    if len(marked) == 4:
+        H, _ = cv2.findHomography(src, dst, method=0)
+    else:
+        H, _ = cv2.findHomography(src, dst, method=cv2.RANSAC, ransacReprojThreshold=3.0)
+    if H is None:
+        raise SystemExit("findHomography failed")
+
+    H_inv = np.linalg.inv(H)
+    from tennisvision.court.homography import HomographyResult
+    used_kids = tuple(POINTS[i][0] for i in marked)
+    hr = HomographyResult(
+        H_img_to_real=H, H_real_to_img=H_inv,
+        subset=used_kids, reprojection_error_m=0.0,
+        used_keypoints=used_kids,
+    )
+
+    # Project all 14 standard keypoints for visualization
+    kps: dict[int, tuple[float, float]] = {}
+    for kid, (xm, ym) in ref.KEYPOINTS_M.items():
+        p = H_inv @ [xm, ym, 1.0]
+        kps[kid] = (float(p[0] / p[2]), float(p[1] / p[2]))
+
+    calib = Calibration.from_homography_result(
+        hr, image_size=(frame.shape[1], frame.shape[0]),
+        keypoints_img=kps, source="click",
+    )
+    save(calib, args.out)
+    print("wrote %s (%d points)" % (args.out, len(marked)))
+    if args.vis:
+        _draw_verification(frame, calib, args.vis)
+        print("wrote", args.vis)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="method", required=True)
@@ -338,6 +475,13 @@ def main():
     br.add_argument("--vis",        default="calib_vis.jpg")
     br.add_argument("--debug",      default=None)
     br.set_defaults(func=cmd_blue_resnet)
+
+    c = sub.add_parser("click", help="Interactive 4-corner calibration (click on video frame)")
+    c.add_argument("--video",  required=True)
+    c.add_argument("--frame",  type=int, default=0, help="Frame number to display")
+    c.add_argument("--out",    default="calib.json")
+    c.add_argument("--vis",    default="calib_vis.jpg")
+    c.set_defaults(func=cmd_click)
 
     t = sub.add_parser("tcd", help="TennisCourtDetector CNN (V1 — requires weights)")
     t.add_argument("--video",   required=True)
