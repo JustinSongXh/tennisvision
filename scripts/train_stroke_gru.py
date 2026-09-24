@@ -166,8 +166,9 @@ class StrokeDataset(Dataset):
                     ymax = kp_seq[i][valid, 1].max()
                     bw = max(xmax - xmin, 1)
                     bh = max(ymax - ymin, 1)
-                    kp_seq[i][:, 0] = (kp_seq[i][:, 0] - xmin) / bw
-                    kp_seq[i][:, 1] = (kp_seq[i][:, 1] - ymin) / bh
+                    scale = max(bw, bh)
+                    kp_seq[i][:, 0] = (kp_seq[i][:, 0] - xmin) / scale
+                    kp_seq[i][:, 1] = (kp_seq[i][:, 1] - ymin) / scale
 
             if len(kp_seq) >= seq_len:
                 # Sliding windows with 50% overlap
