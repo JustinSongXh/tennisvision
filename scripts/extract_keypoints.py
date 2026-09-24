@@ -119,6 +119,7 @@ def main():
                 xn, xx = kp_x[valid].min(), kp_x[valid].max()
                 yn, yx = kp_y[valid].min(), kp_y[valid].max()
                 bw, bh = max(xx - xn, 1), max(yx - yn, 1)
+                scale = max(bw, bh)
                 detections.append({
                     "tid": int(ids[i]), "det_conf": round(float(confs[i]), 3),
                     "bbox": [int(boxes[i][0]), int(boxes[i][1]),
@@ -128,8 +129,8 @@ def main():
                     "kp_x": [round(float(v), 4) for v in kp_x],
                     "kp_y": [round(float(v), 4) for v in kp_y],
                     "kp_v": [round(float(v), 3) for v in kp_v],
-                    "kp_norm_x": [round(float((kp_x[k] - xn) / bw), 4) for k in range(17)],
-                    "kp_norm_y": [round(float((kp_y[k] - yn) / bh), 4) for k in range(17)],
+                    "kp_norm_x": [round(float((kp_x[k] - xn) / scale), 4) for k in range(17)],
+                    "kp_norm_y": [round(float((kp_y[k] - yn) / scale), 4) for k in range(17)],
                 })
 
         frame_data.append({"frame": fi, "detections": detections})
