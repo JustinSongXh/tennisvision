@@ -36,6 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tennisvision.action.slot_mapper import SlotMapper, SLOT_NAMES
 from tennisvision.action.gru_classifier import StrokeGRU, LABELS as GRU_LABELS
+from tennisvision.action.serve_traj import check_serve_toss, compute_net_direction
 
 # ---- Hardcoded fallback (sample_short.mp4) ----
 _DEFAULT_H_IMG_TO_REAL = np.array([
@@ -77,6 +78,7 @@ def main():
         H_img_to_real = _DEFAULT_H_IMG_TO_REAL
         print("Calibration: hardcoded fallback (sample_short.mp4)")
     mapper = SlotMapper(H_img_to_real)
+    net_dir = compute_net_direction(H_img_to_real)
 
     # Load data
     print(f"Loading keypoints: {args.keypoints}")
@@ -262,43 +264,16 @@ def main():
                 if min_x_diff > max(bbox_w * 5, 300):
                     return False, f"ball x too far (min_diff={min_x_diff:.0f}px)"
 
-        # 5. Ball toss check: serve requires upward ball motion (y decreasing)
-        #    in a ±0.5s window around the event start, ball must be near the player
+        # 5. Ball toss check: verify toss-hit trajectory pattern
+        #    (x-stationary segment with upward motion + hit departure)
         if ball_det or ball_pred:
-            fps = data["fps"]
-            half_win = int(round(0.5 * fps))
-            toss_start = max(0, ev["start_frame"] - half_win)
-            toss_end = ev["start_frame"] + half_win
-            bbox_w = bbox[2] - bbox[0]
-            bbox_h = bbox[3] - bbox[1]
-            max_ball_dist_x = max(bbox_w * 3, 200)
-            max_ball_dist_y = max(bbox_h * 3, 200)
-            ys = []
-            for check_fi in range(toss_start, toss_end + 1):
-                bp = _get_ball(check_fi)
-                if bp is None:
-                    continue
-                if abs(bp[0] - foot_x) > max_ball_dist_x:
-                    continue
-                if abs(bp[1] - foot_y) > max_ball_dist_y:
-                    continue
-                ys.append(bp[1])
-            # Look for any sustained upward segment (y decreasing over >=4 consecutive frames)
-            has_toss = False
-            if len(ys) >= 4:
-                streak = 0
-                for i in range(1, len(ys)):
-                    if ys[i] < ys[i - 1] - 2:  # ball moving up by >2px
-                        streak += 1
-                        if streak >= 3:
-                            has_toss = True
-                            break
-                    else:
-                        streak = 0
-            if not ys:
-                return False, "no ball near player in toss window"
-            if not has_toss:
-                return False, "no ball toss (no upward trajectory)"
+            toss_ok, toss_reason = check_serve_toss(
+                _get_ball, ev["start_frame"], ev["end_frame"],
+                foot_x, foot_y, bbox, data["fps"],
+                net_dir=net_dir,
+            )
+            if not toss_ok:
+                return False, toss_reason
 
         return True, ""
 
