@@ -358,6 +358,11 @@ def _write_serve_review(src_video, serves, fps, dst_video, pad_seconds=0.5):
         ret, frame = cap.read()
         if not ret:
             break
+        # Skip clips whose range we've already passed
+        while clip_idx < len(clips) and fi > clips[clip_idx][3]:
+            clip_idx += 1
+        if clip_idx >= len(clips):
+            break
         idx, ev, clip_start, clip_end = clips[clip_idx]
         if clip_start <= fi <= clip_end:
             label = "Serve %d/%d  %s  conf=%.2f  t=%.1fs" % (

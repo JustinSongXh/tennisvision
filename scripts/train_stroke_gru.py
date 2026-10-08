@@ -9,17 +9,17 @@ Requires GPU for reasonable speed.
 
 Usage:
     # Full training (download + extract + train)
-    python -u scripts/train_stroke_gru.py --out weights/stroke_gru_v4_best.pt
+    python -u scripts/train_stroke_gru.py --out weights/stroke_gru_v5_best.pt
 
     # Resume from cached keypoints
     python -u scripts/train_stroke_gru.py \
         --keypoints /path/to/thetis_keypoints.pkl \
-        --out weights/stroke_gru_v4_best.pt
+        --out weights/stroke_gru_v5_best.pt
 
     # Custom hyperparameters
     python -u scripts/train_stroke_gru.py \
-        --out weights/stroke_gru_v4_best.pt \
-        --epochs 80 --seq-len 30 --lr 1e-3
+        --out weights/stroke_gru_v5_best.pt \
+        --epochs 30 --seq-len 30 --lr 1e-3
 """
 
 from __future__ import annotations
@@ -42,20 +42,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tennisvision.action.gru_classifier import StrokeGRU
 
-# THETIS categories → our 3-class labels (background is synthetic)
+# THETIS 7 core categories → 3-class labels (background is synthetic via smart-slicing)
+# v4 used these 7 (1155 videos). The 5 excluded (slice/volley/smash) add noise.
 THETIS_CATEGORIES = {
     'flat_service': 'serve',
     'kick_service': 'serve',
     'slice_service': 'serve',
     'forehand_flat': 'forehand',
     'forehand_openstands': 'forehand',
-    'forehand_slice': 'forehand',
-    'forehand_volley': 'forehand',
     'backhand': 'backhand',
     'backhand2hands': 'backhand',
-    'backhand_slice': 'backhand',
-    'backhand_volley': 'backhand',
-    'smash': 'forehand',
 }
 
 LABEL2IDX = {'backhand': 0, 'forehand': 1, 'serve': 2, 'background': 3}
@@ -149,41 +145,76 @@ def extract_keypoints(data_dir: str, out_pkl: str) -> list:
 # Step 3: Dataset + Training
 # ------------------------------------------------------------------
 
-class StrokeDataset(Dataset):
-    """Sliding-window dataset from keypoint sequences."""
+def _find_peak(kp_seq):
+    """Find the frame with maximum wrist movement (action peak)."""
+    WRIST = [9, 10]  # L_wrist, R_wrist in COCO 17
+    max_speed, peak = 0.0, len(kp_seq) // 2
+    for i in range(1, len(kp_seq)):
+        speed = 0.0
+        for w in WRIST:
+            if kp_seq[i][w, 2] > 0.3 and kp_seq[i - 1][w, 2] > 0.3:
+                speed += np.sqrt((kp_seq[i][w, 0] - kp_seq[i - 1][w, 0]) ** 2 +
+                                 (kp_seq[i][w, 1] - kp_seq[i - 1][w, 1]) ** 2)
+        if speed > max_speed:
+            max_speed = speed
+            peak = i
+    return peak
 
-    def __init__(self, sequences: list, seq_len: int = 30):
+
+def _normalize_seq(kp_seq):
+    """Apply uniform-scale bbox-relative normalization per frame."""
+    kp_seq = kp_seq.copy()
+    for i in range(len(kp_seq)):
+        valid = kp_seq[i][:, 2] > 0.3
+        if valid.sum() >= 3:
+            xmin = kp_seq[i][valid, 0].min()
+            xmax = kp_seq[i][valid, 0].max()
+            ymin = kp_seq[i][valid, 1].min()
+            ymax = kp_seq[i][valid, 1].max()
+            bw = max(xmax - xmin, 1)
+            bh = max(ymax - ymin, 1)
+            scale = max(bw, bh)
+            kp_seq[i][:, 0] = (kp_seq[i][:, 0] - xmin) / scale
+            kp_seq[i][:, 1] = (kp_seq[i][:, 1] - ymin) / scale
+    return kp_seq
+
+
+class StrokeDataset(Dataset):
+    """Smart-slice dataset: peak±radius = action, rest = background."""
+
+    def __init__(self, sequences: list, seq_len: int = 30, peak_radius: int = 15):
         self.samples = []
         for kp_seq, label in sequences:
-            kp_seq = kp_seq.copy()
-            # Bbox-relative normalization per frame
-            for i in range(len(kp_seq)):
-                valid = kp_seq[i][:, 2] > 0.3
-                if valid.sum() >= 3:
-                    xmin = kp_seq[i][valid, 0].min()
-                    xmax = kp_seq[i][valid, 0].max()
-                    ymin = kp_seq[i][valid, 1].min()
-                    ymax = kp_seq[i][valid, 1].max()
-                    bw = max(xmax - xmin, 1)
-                    bh = max(ymax - ymin, 1)
-                    scale = max(bw, bh)
-                    kp_seq[i][:, 0] = (kp_seq[i][:, 0] - xmin) / scale
-                    kp_seq[i][:, 1] = (kp_seq[i][:, 1] - ymin) / scale
-
-            if len(kp_seq) >= seq_len:
-                # Sliding windows with 50% overlap
-                for start in range(0, len(kp_seq) - seq_len + 1, seq_len // 2):
-                    window = kp_seq[start:start + seq_len]
-                    feat = window[:, :, :2].reshape(seq_len, -1)
-                    self.samples.append((feat.astype(np.float32), LABEL2IDX[label]))
-            else:
-                # Pad short sequences
-                padded = np.concatenate([
+            # Find peak on raw pixel coordinates (before normalization)
+            peak = _find_peak(kp_seq)
+            kp_seq = _normalize_seq(kp_seq)
+            n = len(kp_seq)
+            if n < seq_len:
+                kp_seq = np.concatenate([
                     kp_seq,
-                    np.tile(kp_seq[-1:], (seq_len - len(kp_seq), 1, 1))
+                    np.tile(kp_seq[-1:], (seq_len - n, 1, 1))
                 ])
-                feat = padded[:seq_len, :, :2].reshape(seq_len, -1)
-                self.samples.append((feat.astype(np.float32), LABEL2IDX[label]))
+                n = len(kp_seq)
+
+            # Action zone: peak ± radius
+            act_start = max(0, peak - peak_radius)
+            act_end = min(n, peak + peak_radius)
+
+            # Action windows: 75% overlap, must overlap action zone
+            stride = seq_len // 4
+            for start in range(0, n - seq_len + 1, stride):
+                end = start + seq_len
+                if end > act_start and start < act_end:
+                    feat = kp_seq[start:end, :, :2].reshape(seq_len, -1)
+                    self.samples.append((feat.astype(np.float32), LABEL2IDX[label]))
+
+            # Background windows: fully outside action zone
+            bg_stride = max(stride // 2, 1)
+            for start in range(0, n - seq_len + 1, bg_stride):
+                end = start + seq_len
+                if end <= act_start or start >= act_end:
+                    feat = kp_seq[start:end, :, :2].reshape(seq_len, -1)
+                    self.samples.append((feat.astype(np.float32), LABEL2IDX['background']))
 
     def __len__(self):
         return len(self.samples)
@@ -204,6 +235,12 @@ def train(sequences: list, out_path: str, epochs: int = 50,
     train_dl = DataLoader(train_ds, batch_size=64, shuffle=True)
     val_dl = DataLoader(val_ds, batch_size=64)
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
+    idx2label = {v: k for k, v in LABEL2IDX.items()}
+    for ds, name in [(train_ds, "Train"), (val_ds, "Val")]:
+        from collections import Counter
+        counts = Counter(label for _, label in ds.samples)
+        parts = [f"{idx2label[k]}:{v}" for k, v in sorted(counts.items())]
+        print(f"  {name}: {', '.join(parts)}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = StrokeGRU(n_classes=n_classes).to(device)
@@ -262,7 +299,7 @@ def main():
                         help="Pre-extracted keypoints pickle (skip download+extract)")
     parser.add_argument("--data-dir", default="/tmp/thetis_rgb",
                         help="Directory for THETIS videos (default: /tmp/thetis_rgb)")
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--seq-len", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--n-classes", type=int, default=4,
