@@ -37,7 +37,7 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--keypoints", required=True)
     parser.add_argument("--calib", required=True)
-    parser.add_argument("--gru", default="weights/stroke_gru_v4_best.pt")
+    parser.add_argument("--gru", default="weights/stroke_gru_v5_best.pt")
     parser.add_argument("--out", required=True)
     parser.add_argument("--speed-threshold", type=float, default=0.15,
                         help="Wrist speed threshold to activate GRU")

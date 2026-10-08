@@ -32,7 +32,7 @@ LABELS = {0: "backhand", 1: "forehand", 2: "serve", 3: "background"}
 
 @dataclass
 class GRUClassifierConfig:
-    weights: str = "weights/stroke_gru_v4_best.pt"
+    weights: str = "weights/stroke_gru_v5_best.pt"
     seq_len: int = 30
     speed_threshold: float = 0.15     # wrist speed trigger
     serve_threshold: float = 0.8      # serve prob marking

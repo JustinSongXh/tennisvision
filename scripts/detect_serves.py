@@ -50,7 +50,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--keypoints", required=True)
-    parser.add_argument("--gru", default="weights/stroke_gru_v4_best.pt")
+    parser.add_argument("--gru", default="weights/stroke_gru_v5_best.pt")
     parser.add_argument("--calib", default=None,
                         help="calib.json with H_img_to_real (omit to use hardcoded fallback)")
     parser.add_argument("--video", default=None,

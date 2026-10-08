@@ -138,7 +138,7 @@ def step4(out_dir, weights_dir):
     return run_script("detect_serves.py", [
         "--keypoints", os.path.join(out_dir, "keypoints.json"),
         "--calib", os.path.join(out_dir, "calib.json"),
-        "--gru", os.path.join(weights_dir, "stroke_gru_v4_best.pt"),
+        "--gru", os.path.join(weights_dir, "stroke_gru_v5_best.pt"),
         "--out", out_path,
     ])
 
