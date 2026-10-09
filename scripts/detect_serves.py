@@ -174,9 +174,10 @@ class PoseExtractor:
             xn, xx = kp_x[valid].min(), kp_x[valid].max()
             yn, yx = kp_y[valid].min(), kp_y[valid].max()
             bw, bh = max(xx - xn, 1), max(yx - yn, 1)
+            scale = max(bw, bh)
             det_out = dict(detections[i])
-            det_out["kp_norm_x"] = [round(float((kp_x[k] - xn) / bw), 4) for k in range(17)]
-            det_out["kp_norm_y"] = [round(float((kp_y[k] - yn) / bh), 4) for k in range(17)]
+            det_out["kp_norm_x"] = [round(float((kp_x[k] - xn) / scale), 4) for k in range(17)]
+            det_out["kp_norm_y"] = [round(float((kp_y[k] - yn) / scale), 4) for k in range(17)]
             results.append(det_out)
 
         return results
@@ -295,7 +296,7 @@ def main():
     parser.add_argument("--calib", required=True, help="calib.json")
     parser.add_argument("--video", required=True,
                         help="Original video (for on-demand pose extraction)")
-    parser.add_argument("--gru", default="weights/stroke_gru_v4_best.pt")
+    parser.add_argument("--gru", default="weights/stroke_gru_v5_best.pt")
     parser.add_argument("--ball", default=None,
                         help="ball_positions.json for toss filtering")
     parser.add_argument("--out", required=True)
