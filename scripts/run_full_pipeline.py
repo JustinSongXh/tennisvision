@@ -174,9 +174,18 @@ def step6_actions(video_path, out_dir, weights_dir, no_half):
         print(f"  Already exists: {out_path}")
         return True
 
-    # TODO: implement classify_actions.py
-    print("  Not yet implemented — skipping")
-    return True
+    args = [
+        "--players", os.path.join(out_dir, "player_detections.json"),
+        "--rallies", os.path.join(out_dir, "rally_events.json"),
+        "--calib", os.path.join(out_dir, "calib.json"),
+        "--video", video_path,
+        "--gru", os.path.join(weights_dir, "stroke_gru_v4_best.pt"),
+        "--ball", os.path.join(out_dir, "ball_positions.json"),
+        "--out", out_path,
+    ]
+    if no_half:
+        args += ["--no-half"]
+    return run_script("classify_actions.py", args)
 
 
 # ============================================================
