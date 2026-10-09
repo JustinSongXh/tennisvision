@@ -1,35 +1,39 @@
 #!/usr/bin/env python3
 """TennisVision — Full rally detection pipeline.
 
-Orchestrates five steps, each calling a standalone script via subprocess:
+Orchestrates six steps, each calling a standalone script via subprocess:
   1. Court calibration      → calib.json + court_overlay.jpg   (calibrate.py)
-  2. Keypoints extraction   → keypoints.json                   (extract_keypoints.py)
-  3. Ball trajectory        → ball_positions.json               (extract_ball_positions.py)
+  2. Ball trajectory        → ball_positions.json               (extract_ball_positions.py)
+  3. Player detection       → player_detections.json            (detect_players.py)
   4. Serve detection        → serve_events.json                 (detect_serves.py)
+     (scene readiness + on-demand pose + GRU + toss filter)
   5. Rally detection        → rally_events.json + rally_cuts.mp4 (detect_rallies.py)
+  6. Action classification  → action_events.json                (classify_actions.py) [optional]
+
+Steps 2 and 3 are independent and could run in parallel.
+Step 4 consumes Steps 1+2+3. Step 5 consumes Step 4. Step 6 is optional.
 
 All outputs saved to results/<video_name>/.
 
 Usage:
-    # Full run
-    python scripts/run_full_pipeline.py --video samples/sample_short.mp4
+    # Full run (steps 1-5, skip step 6)
+    python scripts/run_full_pipeline.py --video samples/sample3.mp4
 
     # Single step
-    python scripts/run_full_pipeline.py --video samples/sample_short.mp4 --step 1
+    python scripts/run_full_pipeline.py --video samples/sample3.mp4 --step 1
+
+    # Include optional action classification
+    python scripts/run_full_pipeline.py --video samples/sample3.mp4 --with-actions
 
     # Custom weights directory (e.g. Kaggle)
     python scripts/run_full_pipeline.py --video video.mp4 --weights-dir /path/to/weights
 
     # Limit frames (for testing)
-    python scripts/run_full_pipeline.py --video samples/sample_short.mp4 --max-frames 1800
-
-    # Disable FP16
-    python scripts/run_full_pipeline.py --video samples/sample_short.mp4 --no-half
+    python scripts/run_full_pipeline.py --video samples/sample3.mp4 --max-frames 1800
 """
 
 import argparse
 import os
-import shutil
 import subprocess
 import sys
 
@@ -69,7 +73,7 @@ def run_script(name, args_list):
 
 # ============================================================
 
-def step1(video_path, out_dir, weights_dir):
+def step1_calibrate(video_path, out_dir, weights_dir):
     print_banner(1, "Court Calibration")
     calib_path = os.path.join(out_dir, "calib.json")
     vis_path = os.path.join(out_dir, "court_overlay.jpg")
@@ -87,27 +91,8 @@ def step1(video_path, out_dir, weights_dir):
     ])
 
 
-def step2(video_path, out_dir, max_frames, no_half):
-    print_banner(2, "Keypoints Extraction")
-    kp_path = os.path.join(out_dir, "keypoints.json")
-
-    if os.path.exists(kp_path):
-        print(f"  Already exists: {kp_path}")
-        return True
-
-    args = [
-        "--video", video_path,
-        "--out", kp_path,
-    ]
-    if max_frames > 0:
-        args += ["--max-frames", str(max_frames)]
-    if no_half:
-        args += ["--no-half"]
-    return run_script("extract_keypoints.py", args)
-
-
-def step3(video_path, out_dir, weights_dir, config_path, max_frames):
-    print_banner(3, "Ball Trajectory")
+def step2_ball(video_path, out_dir, weights_dir, config_path, max_frames):
+    print_banner(2, "Ball Trajectory")
     out_path = os.path.join(out_dir, "ball_positions.json")
 
     if os.path.exists(out_path):
@@ -127,7 +112,26 @@ def step3(video_path, out_dir, weights_dir, config_path, max_frames):
     return run_script("extract_ball_positions.py", args)
 
 
-def step4(out_dir, weights_dir):
+def step3_players(video_path, out_dir, max_frames, no_half):
+    print_banner(3, "Player Detection")
+    out_path = os.path.join(out_dir, "player_detections.json")
+
+    if os.path.exists(out_path):
+        print(f"  Already exists: {out_path}")
+        return True
+
+    args = [
+        "--video", video_path,
+        "--out", out_path,
+    ]
+    if max_frames > 0:
+        args += ["--max-frames", str(max_frames)]
+    if no_half:
+        args += ["--no-half"]
+    return run_script("detect_players.py", args)
+
+
+def step4_serves(video_path, out_dir, weights_dir, no_half):
     print_banner(4, "Serve Detection")
     out_path = os.path.join(out_dir, "serve_events.json")
 
@@ -135,15 +139,20 @@ def step4(out_dir, weights_dir):
         print(f"  Already exists: {out_path}")
         return True
 
-    return run_script("detect_serves.py", [
-        "--keypoints", os.path.join(out_dir, "keypoints.json"),
+    args = [
+        "--players", os.path.join(out_dir, "player_detections.json"),
         "--calib", os.path.join(out_dir, "calib.json"),
-        "--gru", os.path.join(weights_dir, "stroke_gru_v5_best.pt"),
+        "--video", video_path,
+        "--gru", os.path.join(weights_dir, "stroke_gru_v4_best.pt"),
+        "--ball", os.path.join(out_dir, "ball_positions.json"),
         "--out", out_path,
-    ])
+    ]
+    if no_half:
+        args += ["--no-half"]
+    return run_script("detect_serves.py", args)
 
 
-def step5(video_path, out_dir):
+def step5_rallies(video_path, out_dir):
     print_banner(5, "Rally Detection")
     rally_json = os.path.join(out_dir, "rally_events.json")
 
@@ -157,30 +166,37 @@ def step5(video_path, out_dir):
     ])
 
 
+def step6_actions(video_path, out_dir, weights_dir, no_half):
+    print_banner(6, "Action Classification (optional)")
+    out_path = os.path.join(out_dir, "action_events.json")
+
+    if os.path.exists(out_path):
+        print(f"  Already exists: {out_path}")
+        return True
+
+    # TODO: implement classify_actions.py
+    print("  Not yet implemented — skipping")
+    return True
+
+
 # ============================================================
 
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--video", required=True)
-    parser.add_argument("--step", type=int, default=0, help="Single step (1-5). 0=all.")
-    parser.add_argument("--keypoints", default=None, help="Pre-extracted keypoints JSON")
+    parser.add_argument("--step", type=int, default=0, help="Single step (1-6). 0=all.")
     parser.add_argument("--config", default=None, help="YAML config for ball detector")
     parser.add_argument("--weights-dir", default="weights",
                         help="Directory containing model weights")
     parser.add_argument("--max-frames", type=int, default=0, help="Limit frames (0=all)")
     parser.add_argument("--no-half", action="store_true", help="Disable FP16")
+    parser.add_argument("--with-actions", action="store_true",
+                        help="Run optional Step 6 (action classification)")
     args = parser.parse_args()
 
     out_dir = get_out_dir(args.video)
     wdir = args.weights_dir
-
-    # Copy pre-extracted keypoints if provided
-    if args.keypoints and os.path.exists(args.keypoints):
-        dst = os.path.join(out_dir, "keypoints.json")
-        if not os.path.exists(dst):
-            shutil.copy2(args.keypoints, dst)
-            print(f"Copied keypoints to {dst}")
 
     print()
     print("=" * 60)
@@ -196,21 +212,27 @@ def main():
     run_all = args.step == 0
 
     if run_all or args.step == 1:
-        if not step1(args.video, out_dir, wdir):
+        if not step1_calibrate(args.video, out_dir, wdir):
             return
 
     if run_all or args.step == 2:
-        if not step2(args.video, out_dir, args.max_frames, args.no_half):
+        if not step2_ball(args.video, out_dir, wdir, args.config, args.max_frames):
             return
 
     if run_all or args.step == 3:
-        step3(args.video, out_dir, wdir, args.config, args.max_frames)
+        if not step3_players(args.video, out_dir, args.max_frames, args.no_half):
+            return
 
     if run_all or args.step == 4:
-        step4(out_dir, wdir)
+        if not step4_serves(args.video, out_dir, wdir, args.no_half):
+            return
 
     if run_all or args.step == 5:
-        step5(args.video, out_dir)
+        if not step5_rallies(args.video, out_dir):
+            return
+
+    if args.with_actions or args.step == 6:
+        step6_actions(args.video, out_dir, wdir, args.no_half)
 
     if run_all:
         print()
