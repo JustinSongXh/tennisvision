@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Multi-signal serve detection.
+"""Multi-signal serve detection (v6).
 
 Pipeline:
   1. Load player detections (bbox only, from detect_players.py)
   2. Slot mapping via homography (auto-detect singles/doubles)
   3. Scene readiness: 3+ slots stable for 0.5s+
-  4. On-demand keypoint extraction (YOLO-pose, only during ready windows)
-  5. Wrist speed trigger → GRU classification
-  6. Post-merge filtering: net distance, ball toss, frame edge
+  4. Hand-above-head trigger on baseline players
+  5. Track to peak (last highest wrist) → asymmetric 15-frame window
+  6. On-demand pose extraction + v4 normalization → GRU confirmation
+  7. Post-merge filtering: net distance, ball toss, frame edge
 
 Inputs:
   --players   player_detections.json (Step 3)
@@ -40,26 +41,30 @@ from tennisvision.action.slot_mapper import SlotMapper, SLOT_NAMES
 from tennisvision.action.gru_classifier import StrokeGRU, LABELS as GRU_LABELS
 from tennisvision.action.serve_traj import check_serve_toss, compute_net_direction
 
+TARGET_FPS = 15
+SEQ_LEN = 15        # 1 second @ 15fps
+BEFORE_PEAK = 9     # frames before peak
+AFTER_PEAK = 5      # frames after peak
+WRIST = [9, 10]     # L_wrist, R_wrist in COCO 17
+NOSE = 0
+
 
 # =====================================================================
 # Auto-detect singles vs doubles
 # =====================================================================
 
 def detect_match_type(frames, mapper, sample_size=3000):
-    """Scan initial frames to determine singles (2) or doubles (4)."""
     slot_fill_counts = []
     for fd in frames[:sample_size]:
         slot_dets = mapper.assign(fd["detections"])
         slot_fill_counts.append(len(slot_dets))
     if not slot_fill_counts:
-        return 4  # default doubles
-    # Look at the 75th percentile of slot fill during "busy" frames
+        return 4
     busy = [c for c in slot_fill_counts if c >= 2]
     if not busy:
         return 4
     p75 = sorted(busy)[int(len(busy) * 0.75)]
-    match_type = 2 if p75 <= 2 else 4
-    return match_type
+    return 2 if p75 <= 2 else 4
 
 
 # =====================================================================
@@ -67,12 +72,10 @@ def detect_match_type(frames, mapper, sample_size=3000):
 # =====================================================================
 
 class SceneReadiness:
-    """Track slot occupancy and position stability."""
-
     def __init__(self, ready_frames, min_slots=3):
         self.ready_frames = ready_frames
         self.min_slots = min_slots
-        self.slot_foot = {s: [] for s in range(4)}  # (fi, fx, fy)
+        self.slot_foot = {s: [] for s in range(4)}
 
     def update(self, fi, slot_dets):
         for slot, det in slot_dets.items():
@@ -103,9 +106,7 @@ class SceneReadiness:
 # =====================================================================
 
 class PoseExtractor:
-    """Extract keypoints on demand from video crops."""
-
-    def __init__(self, video_path, device, quantize, no_half=False):
+    def __init__(self, video_path, device, quantize):
         from ultralytics import YOLO
         self.cap = cv2.VideoCapture(video_path)
         self.W = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -116,11 +117,11 @@ class PoseExtractor:
         self.crop_pad = 0.15
         self._last_fi = -1
         self._last_frame = None
+        self.pose_count = 0
 
     def _read_frame(self, fi):
         if fi == self._last_fi:
             return self._last_frame
-        # Sequential reads are fine since we process in order
         if fi != self._last_fi + 1:
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
         ret, frame = self.cap.read()
@@ -128,106 +129,199 @@ class PoseExtractor:
         self._last_frame = frame if ret else None
         return self._last_frame
 
-    def extract(self, fi, detections):
-        """Extract keypoints for detections in frame fi.
-
-        Returns list of dicts with kp_norm_x, kp_norm_y added.
-        """
+    def extract_single(self, fi, det):
+        """Extract keypoints for a single detection. Returns dict with raw kp or None."""
         frame = self._read_frame(fi)
         if frame is None:
-            return []
+            return None
 
         W, H = self.W, self.H
-        crops, offsets, kept = [], [], []
-        for i, det in enumerate(detections):
-            bbox = det["bbox"]
-            x0, y0, x1, y1 = bbox
-            pad = int(self.crop_pad * max(x1 - x0, y1 - y0))
-            cx0, cy0 = max(0, x0 - pad), max(0, y0 - pad)
-            cx1, cy1 = min(W, x1 + pad), min(H, y1 + pad)
-            crops.append(frame[cy0:cy1, cx0:cx1])
-            offsets.append((cx0, cy0))
-            kept.append(i)
+        bbox = det["bbox"]
+        x0, y0, x1, y1 = bbox
+        pad = int(self.crop_pad * max(x1 - x0, y1 - y0))
+        cx0, cy0 = max(0, x0 - pad), max(0, y0 - pad)
+        cx1, cy1 = min(W, x1 + pad), min(H, y1 + pad)
+        crop = frame[cy0:cy1, cx0:cx1]
 
-        if not crops:
-            return []
-
-        prs = self.pose_model.predict(crops, verbose=False, classes=[0],
+        prs = self.pose_model.predict([crop], verbose=False, classes=[0],
                                        conf=0.15, imgsz=640, device=self.device,
                                        quantize=self.quantize)
+        self.pose_count += 1
 
-        results = []
-        for j, i in enumerate(kept):
-            if j >= len(prs):
-                continue
-            pr = prs[j]
-            if pr.boxes is None or len(pr.boxes) == 0 or pr.keypoints is None:
-                continue
-            best = int(pr.boxes.conf.cpu().numpy().argmax())
-            kp = pr.keypoints.data[best].cpu().numpy()
-            kp_x = kp[:, 0] + offsets[j][0]
-            kp_y = kp[:, 1] + offsets[j][1]
-            kp_v = kp[:, 2]
-            valid = kp_v >= 0.3
-            if valid.sum() < 3:
-                continue
-            xn, xx = kp_x[valid].min(), kp_x[valid].max()
-            yn, yx = kp_y[valid].min(), kp_y[valid].max()
-            bw, bh = max(xx - xn, 1), max(yx - yn, 1)
-            det_out = dict(detections[i])
-            det_out["kp_norm_x"] = [round(float((kp_x[k] - xn) / bw), 4) for k in range(17)]
-            det_out["kp_norm_y"] = [round(float((kp_y[k] - yn) / bh), 4) for k in range(17)]
-            results.append(det_out)
+        if not prs or prs[0].boxes is None or len(prs[0].boxes) == 0 or prs[0].keypoints is None:
+            return None
 
-        return results
+        pr = prs[0]
+        best = int(pr.boxes.conf.cpu().numpy().argmax())
+        kp = pr.keypoints.data[best].cpu().numpy()
+        kp_x = kp[:, 0] + cx0
+        kp_y = kp[:, 1] + cy0
+        kp_v = kp[:, 2]
+
+        return {"kp_x": kp_x, "kp_y": kp_y, "kp_v": kp_v}
 
     def close(self):
         self.cap.release()
 
 
+def normalize_kp(kp_x, kp_y, kp_v):
+    """v4-style normalization: x/bw, y/bh (stretch to square)."""
+    valid = kp_v >= 0.3
+    if valid.sum() < 3:
+        return None
+    xn, xx = kp_x[valid].min(), kp_x[valid].max()
+    yn, yx = kp_y[valid].min(), kp_y[valid].max()
+    bw, bh = max(xx - xn, 1), max(yx - yn, 1)
+    norm_x = (kp_x - xn) / bw
+    norm_y = (kp_y - yn) / bh
+    return np.stack([norm_x, norm_y], axis=1).astype(np.float32)
+
+
 # =====================================================================
-# Buffer with interpolation
+# Hand-above-head serve detector
 # =====================================================================
 
-def build_buffer(slot_buf, fi, seq_len, max_missing_ratio=0.2):
-    """Build SEQ_LEN buffer with interpolation for small gaps.
+class ServeDetector:
+    """Detect serves via hand-above-head trigger + GRU confirmation.
 
-    slot_buf: list of (frame_idx, kp_array)
-    Returns (np.array, ok).
+    State machine per slot:
+      IDLE → hand above head → TRACKING (collecting peak)
+      TRACKING → hand descends → PEAKED (run GRU on window)
+      PEAKED → result emitted → COOLDOWN
+      COOLDOWN → cooldown expires → IDLE
     """
-    if not slot_buf:
-        return None, False
 
-    start_fi = fi - seq_len + 1
-    frame_map = {f: kp for f, kp in slot_buf if start_fi <= f <= fi}
+    def __init__(self, fps, cooldown_seconds=2.0):
+        self.fps = fps
+        self.cooldown_frames = int(round(cooldown_seconds * fps))
+        # Downsample ratio: video fps → 15fps
+        self.ds_interval = max(1, int(round(fps / TARGET_FPS)))
+        # Per-slot state
+        self.state = {s: "IDLE" for s in range(4)}
+        self.tracking_start = {s: 0 for s in range(4)}
+        self.min_wrist_y = {s: float('inf') for s in range(4)}
+        self.peak_frame = {s: 0 for s in range(4)}
+        self.cooldown_until = {s: 0 for s in range(4)}
+        # Raw keypoint buffer per slot: (fi, kp_x, kp_y, kp_v)
+        self.raw_buf = {s: [] for s in range(4)}
+        self.RAW_BUF_MAX = int(round(3 * fps))  # 3 seconds of raw frames
 
-    if len(frame_map) < seq_len * (1 - max_missing_ratio):
-        return None, False
+    def _is_above_head(self, kp_x, kp_y, kp_v):
+        """Check if any wrist is above the nose."""
+        if kp_v[NOSE] < 0.3:
+            return False
+        nose_y = kp_y[NOSE]
+        for w in WRIST:
+            if kp_v[w] > 0.3 and kp_y[w] < nose_y:
+                return True
+        return False
 
-    result = []
-    for t in range(start_fi, fi + 1):
-        if t in frame_map:
-            result.append(frame_map[t])
-        else:
-            prev_f = prev_kp = next_f = next_kp = None
-            for dt in range(1, seq_len):
-                if prev_kp is None and (t - dt) in frame_map:
-                    prev_f, prev_kp = t - dt, frame_map[t - dt]
-                if next_kp is None and (t + dt) in frame_map:
-                    next_f, next_kp = t + dt, frame_map[t + dt]
-                if prev_kp is not None and next_kp is not None:
-                    break
-            if prev_kp is not None and next_kp is not None:
-                alpha = (t - prev_f) / (next_f - prev_f)
-                result.append(prev_kp * (1 - alpha) + next_kp * alpha)
-            elif prev_kp is not None:
-                result.append(prev_kp)
-            elif next_kp is not None:
-                result.append(next_kp)
+    def _get_wrist_min_y(self, kp_y, kp_v):
+        """Get the lowest y (highest position) among valid wrists."""
+        min_y = float('inf')
+        for w in WRIST:
+            if kp_v[w] > 0.3 and kp_y[w] < min_y:
+                min_y = kp_y[w]
+        return min_y
+
+    def update(self, fi, slot, kp_x, kp_y, kp_v):
+        """Update state machine for one slot. Returns peak_frame if serve candidate detected."""
+        # Store raw keypoints
+        self.raw_buf[slot].append((fi, kp_x.copy(), kp_y.copy(), kp_v.copy()))
+        if len(self.raw_buf[slot]) > self.RAW_BUF_MAX:
+            self.raw_buf[slot] = self.raw_buf[slot][-self.RAW_BUF_MAX:]
+
+        state = self.state[slot]
+        above = self._is_above_head(kp_x, kp_y, kp_v)
+
+        if state == "IDLE":
+            if fi < self.cooldown_until[slot]:
+                return None
+            if above:
+                self.state[slot] = "TRACKING"
+                self.tracking_start[slot] = fi
+                self.min_wrist_y[slot] = self._get_wrist_min_y(kp_y, kp_v)
+                self.peak_frame[slot] = fi
+            return None
+
+        elif state == "TRACKING":
+            if above:
+                wy = self._get_wrist_min_y(kp_y, kp_v)
+                if wy < self.min_wrist_y[slot]:
+                    self.min_wrist_y[slot] = wy
+                    self.peak_frame[slot] = fi
+                # Timeout: if tracking for > 2 seconds, give up
+                if fi - self.tracking_start[slot] > 2 * self.fps:
+                    self.state[slot] = "IDLE"
+                return None
             else:
-                return None, False
+                # Hand descended — peak found
+                peak = self.peak_frame[slot]
+                self.state[slot] = "IDLE"
+                self.cooldown_until[slot] = fi + self.cooldown_frames
+                return peak
 
-    return np.array(result, dtype=np.float32), True
+        return None
+
+    def build_window(self, slot, peak_frame):
+        """Build 15-frame window around peak, downsampled to 15fps.
+
+        Returns (np.array of shape (15, 17, 2), ok).
+        """
+        buf = self.raw_buf[slot]
+        if not buf:
+            return None, False
+
+        # Determine frame range for asymmetric window at video fps
+        before_frames = int(BEFORE_PEAK * self.ds_interval)
+        after_frames = int(AFTER_PEAK * self.ds_interval)
+        window_start = peak_frame - before_frames
+        window_end = peak_frame + after_frames
+
+        # Collect available frames in this range
+        frame_map = {}
+        for fi, kx, ky, kv in buf:
+            if window_start <= fi <= window_end:
+                kp_norm = normalize_kp(kx, ky, kv)
+                if kp_norm is not None:
+                    frame_map[fi] = kp_norm
+
+        if len(frame_map) < 5:  # too few frames
+            return None, False
+
+        # Sample at 15fps: pick SEQ_LEN evenly spaced frames
+        sample_frames = np.linspace(window_start, window_end, SEQ_LEN)
+        sample_frames = np.round(sample_frames).astype(int)
+
+        result = []
+        sorted_keys = sorted(frame_map.keys())
+        for target in sample_frames:
+            if target in frame_map:
+                result.append(frame_map[target])
+            else:
+                # Find nearest available frame
+                best_fi = min(sorted_keys, key=lambda f: abs(f - target))
+                if abs(best_fi - target) <= self.ds_interval * 2:
+                    result.append(frame_map[best_fi])
+                else:
+                    # Interpolate between two nearest
+                    before = [f for f in sorted_keys if f <= target]
+                    after = [f for f in sorted_keys if f >= target]
+                    if before and after:
+                        bf, af = before[-1], after[0]
+                        if af > bf:
+                            alpha = (target - bf) / (af - bf)
+                            result.append(frame_map[bf] * (1 - alpha) + frame_map[af] * alpha)
+                        else:
+                            result.append(frame_map[bf])
+                    elif before:
+                        result.append(frame_map[before[-1]])
+                    elif after:
+                        result.append(frame_map[after[0]])
+                    else:
+                        return None, False
+
+        return np.array(result, dtype=np.float32), True
 
 
 # =====================================================================
@@ -295,17 +389,13 @@ def main():
     parser.add_argument("--calib", required=True, help="calib.json")
     parser.add_argument("--video", required=True,
                         help="Original video (for on-demand pose extraction)")
-    parser.add_argument("--gru", default="weights/stroke_gru_v4_best.pt")
+    parser.add_argument("--gru", default="weights/stroke_gru_v6_best.pt")
     parser.add_argument("--ball", default=None,
                         help="ball_positions.json for toss filtering")
     parser.add_argument("--out", required=True)
-    # Thresholds (seconds at API surface)
     parser.add_argument("--ready-duration", type=float, default=0.5,
                         help="Seconds of scene stability for readiness")
-    parser.add_argument("--speed-threshold", type=float, default=0.15)
     parser.add_argument("--serve-threshold", type=float, default=0.8)
-    parser.add_argument("--gap-tolerance", type=int, default=5)
-    parser.add_argument("--seq-len", type=int, default=30)
     parser.add_argument("--min-net-dist", type=float, default=8.0,
                         help="Min distance from net (metres) to accept serve")
     parser.add_argument("--no-half", action="store_true", help="Disable FP16")
@@ -338,191 +428,107 @@ def main():
 
     # ---- Auto-detect singles/doubles ----
     n_players = detect_match_type(frames, mapper)
-    min_ready_slots = max(n_players - 1, 2)  # 3 for doubles, 2 for singles
+    min_ready_slots = max(n_players - 1, 2)
     print(f"Match type: {'doubles' if n_players == 4 else 'singles'} "
           f"({n_players} players, need {min_ready_slots}+ slots for readiness)")
 
-    # ---- Load GRU ----
+    # ---- Load GRU v6 ----
     print(f"Loading GRU: {args.gru}")
     gru = StrokeGRU(n_classes=4)
     gru.load_state_dict(torch.load(args.gru, map_location="cpu"))
     gru.eval()
 
-    # ---- Init pose extractor ----
+    # ---- Init ----
     device = 0 if torch.cuda.is_available() else "cpu"
     quantize = "fp16" if (torch.cuda.is_available() and not args.no_half) else None
-    pose = PoseExtractor(args.video, device, quantize, args.no_half)
+    pose = PoseExtractor(args.video, device, quantize)
 
-    # ---- Processing ----
-    SEQ_LEN = args.seq_len
     READY_FRAMES = int(round(args.ready_duration * fps))
     readiness = SceneReadiness(READY_FRAMES, min_slots=min_ready_slots)
+    detector = ServeDetector(fps)
 
-    # Per-slot state (only active during ready periods)
-    slot_kp_buf = {s: [] for s in range(4)}  # (fi, kp_array)
-    BUF_MAX = SEQ_LEN + 30
-    prev_kps = {s: None for s in range(4)}
-    active = {s: False for s in range(4)}
-    gap_count = {s: 0 for s in range(4)}
     scene_was_ready = False
-
-    serve_hits = []
-    all_events = []
+    serve_candidates = []  # (peak_frame, slot, gru_conf)
     gru_count = 0
-    pose_frames = 0
     t0 = time.time()
 
     for fd in frames:
         fi = fd["frame"]
         slot_dets = mapper.assign(fd["detections"])
 
-        # Always update readiness tracker
+        # Always update readiness
         readiness.update(fi, slot_dets)
-
         ready = readiness.is_ready(fi)
+
         if not ready:
             if scene_was_ready:
-                # Transition ready → not ready: reset buffers
+                # Reset detector state on transition
                 for s in range(4):
-                    slot_kp_buf[s].clear()
-                    prev_kps[s] = None
-                    active[s] = False
-                    gap_count[s] = 0
+                    detector.state[s] = "IDLE"
+                    detector.raw_buf[s].clear()
             scene_was_ready = False
             continue
 
         if not scene_was_ready:
-            # Transition not ready → ready: fresh start
             for s in range(4):
-                slot_kp_buf[s].clear()
-                prev_kps[s] = None
-                active[s] = False
-                gap_count[s] = 0
+                detector.state[s] = "IDLE"
+                detector.raw_buf[s].clear()
         scene_was_ready = True
 
-        # ---- On-demand pose extraction ----
-        # Only extract for detections assigned to slots
-        slot_det_list = []
+        # Extract pose for assigned slots
         for slot in sorted(slot_dets.keys()):
-            slot_det_list.append(slot_dets[slot])
-
-        if slot_det_list:
-            kp_results = pose.extract(fi, slot_det_list)
-            pose_frames += 1
-            # Re-map results back to slots by tid
-            kp_by_tid = {r["tid"]: r for r in kp_results}
-        else:
-            kp_by_tid = {}
-
-        # ---- Per-slot GRU processing ----
-        for slot in range(4):
-            if slot not in slot_dets:
-                if active[slot]:
-                    gap_count[slot] += 1
-                    if gap_count[slot] > args.gap_tolerance:
-                        active[slot] = False
-                continue
-
             det = slot_dets[slot]
-            tid = det["tid"]
-
-            # Check if pose was extracted for this detection
-            if tid not in kp_by_tid:
-                continue
-            kp_det = kp_by_tid[tid]
-            kp = np.stack([kp_det["kp_norm_x"], kp_det["kp_norm_y"]],
-                          axis=1).astype(np.float32)
-
-            slot_kp_buf[slot].append((fi, kp))
-            if len(slot_kp_buf[slot]) > BUF_MAX:
-                slot_kp_buf[slot] = slot_kp_buf[slot][-BUF_MAX:]
-
-            # Wrist speed trigger
-            speed = 0.0
-            if prev_kps[slot] is not None:
-                for wi in [9, 10]:
-                    speed += np.sqrt((kp[wi, 0] - prev_kps[slot][wi, 0]) ** 2 +
-                                     (kp[wi, 1] - prev_kps[slot][wi, 1]) ** 2)
-            prev_kps[slot] = kp
-
-            if speed > args.speed_threshold:
-                active[slot] = True
-                gap_count[slot] = 0
-            elif active[slot]:
-                gap_count[slot] += 1
-                if gap_count[slot] > args.gap_tolerance:
-                    active[slot] = False
-
-            if not active[slot]:
+            raw_kp = pose.extract_single(fi, det)
+            if raw_kp is None:
                 continue
 
-            buf, ok = build_buffer(slot_kp_buf[slot], fi, SEQ_LEN)
+            kp_x, kp_y, kp_v = raw_kp["kp_x"], raw_kp["kp_y"], raw_kp["kp_v"]
+
+            # Update serve detector state machine
+            peak = detector.update(fi, slot, kp_x, kp_y, kp_v)
+            if peak is None:
+                continue
+
+            # Peak detected — build window and run GRU
+            window, ok = detector.build_window(slot, peak)
             if not ok:
                 continue
 
-            feat = buf[:, :, :2].reshape(SEQ_LEN, -1)
+            feat = window[:, :, :2].reshape(SEQ_LEN, -1)
             with torch.no_grad():
                 probs = torch.softmax(
                     gru(torch.FloatTensor(feat).unsqueeze(0)), dim=1
                 )[0].numpy()
             gru_count += 1
-            pred = int(np.argmax(probs))
 
-            event = {
-                "frame": fi,
-                "time": round(fi / fps, 2),
-                "slot": slot,
-                "slot_name": SLOT_NAMES[slot],
-                "label": GRU_LABELS[pred],
-                "conf": round(float(probs[pred]), 3),
-                "probs": {GRU_LABELS[i]: round(float(probs[i]), 3) for i in range(4)},
-            }
-            all_events.append(event)
+            serve_p = float(probs[2])
+            if serve_p > args.serve_threshold:
+                serve_candidates.append({
+                    "peak_frame": peak,
+                    "start_frame": peak - int(BEFORE_PEAK * detector.ds_interval),
+                    "end_frame": peak + int(AFTER_PEAK * detector.ds_interval),
+                    "start_time": round((peak - int(BEFORE_PEAK * detector.ds_interval)) / fps, 2),
+                    "end_time": round((peak + int(AFTER_PEAK * detector.ds_interval)) / fps, 2),
+                    "slot": slot,
+                    "slot_name": SLOT_NAMES[slot],
+                    "conf": round(serve_p, 3),
+                })
 
-            if probs[2] > args.serve_threshold:
-                serve_hits.append((fi, slot, float(probs[2])))
-
-        if fi > 0 and fi % 1000 == 0:
+        if fi > 0 and fi % 2000 == 0:
             e = time.time() - t0
             print(f"  frame {fi}/{len(frames)}  {fi/e:.1f} fps  "
-                  f"pose={pose_frames}  gru={gru_count}")
+                  f"pose={pose.pose_count}  gru={gru_count}  "
+                  f"candidates={len(serve_candidates)}")
 
     pose.close()
 
-    # ---- Merge consecutive serve hits ----
-    merged_serves = []
-    if serve_hits:
-        cs, ce, cslot, cconf = (
-            serve_hits[0][0], serve_hits[0][0], serve_hits[0][1], serve_hits[0][2],
-        )
-        for fi, slot, conf in serve_hits[1:]:
-            if slot == cslot and fi - ce <= 10:
-                ce = fi
-                cconf = max(cconf, conf)
-            else:
-                merged_serves.append({
-                    "start_frame": cs, "end_frame": ce,
-                    "start_time": round(cs / fps, 2),
-                    "end_time": round(ce / fps, 2),
-                    "slot": cslot, "slot_name": SLOT_NAMES[cslot],
-                    "conf": round(cconf, 3),
-                })
-                cs, ce, cslot, cconf = fi, fi, slot, conf
-        merged_serves.append({
-            "start_frame": cs, "end_frame": ce,
-            "start_time": round(cs / fps, 2),
-            "end_time": round(ce / fps, 2),
-            "slot": cslot, "slot_name": SLOT_NAMES[cslot],
-            "conf": round(cconf, 3),
-        })
-
-    # ---- Post-merge filtering ----
+    # ---- Post-filtering ----
     def _get_ball(frame_idx):
         k = str(frame_idx)
         return ball_det.get(k) or ball_pred.get(k)
 
     def _filter_serve(ev):
-        mid_frame = (ev["start_frame"] + ev["end_frame"]) // 2
+        mid_frame = ev["peak_frame"]
         if mid_frame >= len(frames):
             return True, ""
         fd = frames[mid_frame]
@@ -553,7 +559,7 @@ def main():
 
         # 4. Ball x-proximity
         if ball_det or ball_pred:
-            search_start = max(0, ev["start_frame"] - int(fps))
+            search_start = max(0, ev["start_frame"])
             search_end = ev["end_frame"] + 1
             min_x_diff = float("inf")
             for check_fi in range(search_start, search_end):
@@ -578,29 +584,30 @@ def main():
 
         return True, ""
 
-    filtered_serves = []
-    for ev in merged_serves:
+    filtered = []
+    for ev in serve_candidates:
         keep, reason = _filter_serve(ev)
         if keep:
-            filtered_serves.append(ev)
+            filtered.append(ev)
         else:
             print(f"  Filtered: {ev['start_time']}s {ev['slot_name']} - {reason}")
-    merged_serves = filtered_serves
 
     # ---- Print results ----
     elapsed = time.time() - t0
     print(f"\nDone in {elapsed:.0f}s")
-    print(f"  Pose frames: {pose_frames}/{len(frames)} "
-          f"({pose_frames/max(len(frames),1)*100:.0f}%)")
-    print(f"  GRU invocations: {gru_count}")
-    print(f"  Total events: {len(all_events)}")
-    print(f"    backhand: {sum(1 for e in all_events if e['label'] == 'backhand')}")
-    print(f"    forehand: {sum(1 for e in all_events if e['label'] == 'forehand')}")
-    print(f"    serve:    {sum(1 for e in all_events if e['label'] == 'serve')}")
-    print(f"    background: {sum(1 for e in all_events if e['label'] == 'background')}")
+    print(f"  Pose extractions: {pose.pose_count}")
+    print(f"  Hand-above-head triggers: {gru_count}")
+    print(f"  Serve candidates (pre-filter): {len(serve_candidates)}")
+    print(f"  Serve events (post-filter): {len(filtered)}")
 
-    print(f"\nServe events (merged): {len(merged_serves)}")
-    for s in merged_serves:
+    from collections import Counter
+    slots = Counter(s["slot_name"] for s in filtered)
+    for slot in ["NEAR_L", "NEAR_R", "FAR_L", "FAR_R"]:
+        if slots[slot]:
+            print(f"    {slot}: {slots[slot]}")
+
+    print(f"\nServe events:")
+    for s in filtered:
         print(f"  {s['start_time']}s-{s['end_time']}s {s['slot_name']} conf={s['conf']}")
 
     # ---- Save ----
@@ -609,31 +616,28 @@ def main():
         "match_type": "doubles" if n_players == 4 else "singles",
         "params": {
             "ready_duration": args.ready_duration,
-            "speed_threshold": args.speed_threshold,
             "serve_threshold": args.serve_threshold,
-            "gap_tolerance": args.gap_tolerance,
-            "seq_len": args.seq_len,
             "min_net_dist": args.min_net_dist,
+            "target_fps": TARGET_FPS,
+            "seq_len": SEQ_LEN,
         },
         "stats": {
             "total_frames": len(frames),
             "fps": fps,
-            "pose_frames": pose_frames,
-            "gru_invocations": gru_count,
-            "total_events": len(all_events),
+            "pose_extractions": pose.pose_count,
+            "gru_calls": gru_count,
         },
-        "serve_events": merged_serves,
-        "all_events": all_events,
+        "serve_events": filtered,
     }
     with open(args.out, "w") as f:
         json.dump(output, f, indent=2)
     print(f"\nSaved: {args.out}")
 
-    # ---- Serve review video ----
-    if merged_serves:
+    # ---- Serve review ----
+    if filtered:
         review_path = os.path.join(os.path.dirname(args.out) or ".", "serve_review.mp4")
         print(f"\nGenerating serve review: {review_path}")
-        write_serve_review(args.video, merged_serves, fps, review_path)
+        write_serve_review(args.video, filtered, fps, review_path)
 
 
 if __name__ == "__main__":
