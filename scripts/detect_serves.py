@@ -2,27 +2,23 @@
 """Multi-signal serve detection (v6).
 
 Pipeline:
-  1. Load player detections (bbox only, from detect_players.py)
+  1. Load player detections with raw keypoints (from detect_players.py)
   2. Slot mapping via homography (auto-detect singles/doubles)
   3. Scene readiness: 3+ slots stable for 0.5s+
   4. Hand-above-head trigger on baseline players
-  5. Track to peak (last highest wrist) → asymmetric 15-frame window
-  6. On-demand pose extraction + v4 normalization → GRU confirmation
-  7. Post-merge filtering: net distance, ball toss, frame edge
+  5. Track to peak (last highest wrist) → asymmetric 15-frame window @15fps
+  6. v4 normalization → GRU v6 confirmation
+  7. Post-filtering: net distance, ball toss, frame edge
 
-Inputs:
-  --players   player_detections.json (Step 3)
-  --calib     calib.json (Step 1)
-  --ball      ball_positions.json (Step 2, optional)
-  --video     original video (for on-demand pose extraction + serve review)
+No on-demand pose extraction — all keypoints come from Step 3.
 
 Usage:
     python -u scripts/detect_serves.py \
         --players results/sample3/player_detections.json \
         --calib results/sample3/calib.json \
         --ball results/sample3/ball_positions.json \
-        --video samples/sample3.mp4 \
-        --out results/sample3/serve_events.json
+        --out results/sample3/serve_events.json \
+        --video samples/sample3.mp4
 """
 
 import argparse
@@ -38,14 +34,14 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tennisvision.action.slot_mapper import SlotMapper, SLOT_NAMES
-from tennisvision.action.gru_classifier import StrokeGRU, LABELS as GRU_LABELS
+from tennisvision.action.gru_classifier import StrokeGRU
 from tennisvision.action.serve_traj import check_serve_toss, compute_net_direction
 
 TARGET_FPS = 15
-SEQ_LEN = 15        # 1 second @ 15fps
-BEFORE_PEAK = 9     # frames before peak
-AFTER_PEAK = 5      # frames after peak
-WRIST = [9, 10]     # L_wrist, R_wrist in COCO 17
+SEQ_LEN = 15
+BEFORE_PEAK = 9
+AFTER_PEAK = 5
+WRIST = [9, 10]
 NOSE = 0
 
 
@@ -102,70 +98,12 @@ class SceneReadiness:
 
 
 # =====================================================================
-# On-demand keypoint extraction
+# Normalization
 # =====================================================================
-
-class PoseExtractor:
-    def __init__(self, video_path, device, quantize):
-        from ultralytics import YOLO
-        self.cap = cv2.VideoCapture(video_path)
-        self.W = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.H = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.pose_model = YOLO("yolo26s-pose.pt")
-        self.device = device
-        self.quantize = quantize
-        self.crop_pad = 0.15
-        self._last_fi = -1
-        self._last_frame = None
-        self.pose_count = 0
-
-    def _read_frame(self, fi):
-        if fi == self._last_fi:
-            return self._last_frame
-        if fi != self._last_fi + 1:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
-        ret, frame = self.cap.read()
-        self._last_fi = fi
-        self._last_frame = frame if ret else None
-        return self._last_frame
-
-    def extract_single(self, fi, det):
-        """Extract keypoints for a single detection. Returns dict with raw kp or None."""
-        frame = self._read_frame(fi)
-        if frame is None:
-            return None
-
-        W, H = self.W, self.H
-        bbox = det["bbox"]
-        x0, y0, x1, y1 = bbox
-        pad = int(self.crop_pad * max(x1 - x0, y1 - y0))
-        cx0, cy0 = max(0, x0 - pad), max(0, y0 - pad)
-        cx1, cy1 = min(W, x1 + pad), min(H, y1 + pad)
-        crop = frame[cy0:cy1, cx0:cx1]
-
-        prs = self.pose_model.predict([crop], verbose=False, classes=[0],
-                                       conf=0.15, imgsz=640, device=self.device,
-                                       quantize=self.quantize)
-        self.pose_count += 1
-
-        if not prs or prs[0].boxes is None or len(prs[0].boxes) == 0 or prs[0].keypoints is None:
-            return None
-
-        pr = prs[0]
-        best = int(pr.boxes.conf.cpu().numpy().argmax())
-        kp = pr.keypoints.data[best].cpu().numpy()
-        kp_x = kp[:, 0] + cx0
-        kp_y = kp[:, 1] + cy0
-        kp_v = kp[:, 2]
-
-        return {"kp_x": kp_x, "kp_y": kp_y, "kp_v": kp_v}
-
-    def close(self):
-        self.cap.release()
-
 
 def normalize_kp(kp_x, kp_y, kp_v):
     """v4-style normalization: x/bw, y/bh (stretch to square)."""
+    kp_x, kp_y, kp_v = np.array(kp_x), np.array(kp_y), np.array(kp_v)
     valid = kp_v >= 0.3
     if valid.sum() < 3:
         return None
@@ -178,36 +116,29 @@ def normalize_kp(kp_x, kp_y, kp_v):
 
 
 # =====================================================================
-# Hand-above-head serve detector
+# Serve detector state machine
 # =====================================================================
 
 class ServeDetector:
-    """Detect serves via hand-above-head trigger + GRU confirmation.
+    """Hand-above-head trigger → track peak → emit candidate.
 
-    State machine per slot:
-      IDLE → hand above head → TRACKING (collecting peak)
-      TRACKING → hand descends → PEAKED (run GRU on window)
-      PEAKED → result emitted → COOLDOWN
-      COOLDOWN → cooldown expires → IDLE
+    Per-slot states: IDLE → TRACKING → peak found → emit → COOLDOWN → IDLE
     """
 
     def __init__(self, fps, cooldown_seconds=2.0):
         self.fps = fps
         self.cooldown_frames = int(round(cooldown_seconds * fps))
-        # Downsample ratio: video fps → 15fps
         self.ds_interval = max(1, int(round(fps / TARGET_FPS)))
-        # Per-slot state
         self.state = {s: "IDLE" for s in range(4)}
         self.tracking_start = {s: 0 for s in range(4)}
         self.min_wrist_y = {s: float('inf') for s in range(4)}
         self.peak_frame = {s: 0 for s in range(4)}
         self.cooldown_until = {s: 0 for s in range(4)}
-        # Raw keypoint buffer per slot: (fi, kp_x, kp_y, kp_v)
+        # Raw keypoint buffer: (fi, kp_x, kp_y, kp_v)
         self.raw_buf = {s: [] for s in range(4)}
-        self.RAW_BUF_MAX = int(round(3 * fps))  # 3 seconds of raw frames
+        self.RAW_BUF_MAX = int(round(3 * fps))
 
     def _is_above_head(self, kp_x, kp_y, kp_v):
-        """Check if any wrist is above the nose."""
         if kp_v[NOSE] < 0.3:
             return False
         nose_y = kp_y[NOSE]
@@ -217,7 +148,6 @@ class ServeDetector:
         return False
 
     def _get_wrist_min_y(self, kp_y, kp_v):
-        """Get the lowest y (highest position) among valid wrists."""
         min_y = float('inf')
         for w in WRIST:
             if kp_v[w] > 0.3 and kp_y[w] < min_y:
@@ -225,9 +155,8 @@ class ServeDetector:
         return min_y
 
     def update(self, fi, slot, kp_x, kp_y, kp_v):
-        """Update state machine for one slot. Returns peak_frame if serve candidate detected."""
-        # Store raw keypoints
-        self.raw_buf[slot].append((fi, kp_x.copy(), kp_y.copy(), kp_v.copy()))
+        """Returns peak_frame if serve candidate detected, else None."""
+        self.raw_buf[slot].append((fi, kp_x, kp_y, kp_v))
         if len(self.raw_buf[slot]) > self.RAW_BUF_MAX:
             self.raw_buf[slot] = self.raw_buf[slot][-self.RAW_BUF_MAX:]
 
@@ -250,12 +179,10 @@ class ServeDetector:
                 if wy < self.min_wrist_y[slot]:
                     self.min_wrist_y[slot] = wy
                     self.peak_frame[slot] = fi
-                # Timeout: if tracking for > 2 seconds, give up
                 if fi - self.tracking_start[slot] > 2 * self.fps:
                     self.state[slot] = "IDLE"
                 return None
             else:
-                # Hand descended — peak found
                 peak = self.peak_frame[slot]
                 self.state[slot] = "IDLE"
                 self.cooldown_until[slot] = fi + self.cooldown_frames
@@ -272,13 +199,12 @@ class ServeDetector:
         if not buf:
             return None, False
 
-        # Determine frame range for asymmetric window at video fps
         before_frames = int(BEFORE_PEAK * self.ds_interval)
         after_frames = int(AFTER_PEAK * self.ds_interval)
         window_start = peak_frame - before_frames
         window_end = peak_frame + after_frames
 
-        # Collect available frames in this range
+        # Normalize and collect available frames
         frame_map = {}
         for fi, kx, ky, kv in buf:
             if window_start <= fi <= window_end:
@@ -286,34 +212,28 @@ class ServeDetector:
                 if kp_norm is not None:
                     frame_map[fi] = kp_norm
 
-        if len(frame_map) < 5:  # too few frames
+        if len(frame_map) < 5:
             return None, False
 
-        # Sample at 15fps: pick SEQ_LEN evenly spaced frames
-        sample_frames = np.linspace(window_start, window_end, SEQ_LEN)
-        sample_frames = np.round(sample_frames).astype(int)
+        # Sample SEQ_LEN evenly spaced frames
+        sample_frames = np.round(np.linspace(window_start, window_end, SEQ_LEN)).astype(int)
+        sorted_keys = sorted(frame_map.keys())
 
         result = []
-        sorted_keys = sorted(frame_map.keys())
         for target in sample_frames:
             if target in frame_map:
                 result.append(frame_map[target])
             else:
-                # Find nearest available frame
                 best_fi = min(sorted_keys, key=lambda f: abs(f - target))
                 if abs(best_fi - target) <= self.ds_interval * 2:
                     result.append(frame_map[best_fi])
                 else:
-                    # Interpolate between two nearest
                     before = [f for f in sorted_keys if f <= target]
                     after = [f for f in sorted_keys if f >= target]
                     if before and after:
                         bf, af = before[-1], after[0]
-                        if af > bf:
-                            alpha = (target - bf) / (af - bf)
-                            result.append(frame_map[bf] * (1 - alpha) + frame_map[af] * alpha)
-                        else:
-                            result.append(frame_map[bf])
+                        alpha = (target - bf) / max(af - bf, 1)
+                        result.append(frame_map[bf] * (1 - alpha) + frame_map[af] * alpha)
                     elif before:
                         result.append(frame_map[before[-1]])
                     elif after:
@@ -322,6 +242,10 @@ class ServeDetector:
                         return None, False
 
         return np.array(result, dtype=np.float32), True
+
+    def reset_slot(self, slot):
+        self.state[slot] = "IDLE"
+        self.raw_buf[slot].clear()
 
 
 # =====================================================================
@@ -338,21 +262,16 @@ def write_serve_review(src_video, serves, fps, dst_video, pad_seconds=0.5):
     pad = int(round(pad_seconds * fps))
 
     os.makedirs(os.path.dirname(dst_video) or ".", exist_ok=True)
-    writer = cv2.VideoWriter(dst_video, cv2.VideoWriter_fourcc(*"mp4v"),
-                             fps, (W, H))
+    writer = cv2.VideoWriter(dst_video, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
     if not writer.isOpened():
         cap.release()
         raise SystemExit("cannot open writer for " + dst_video)
 
-    clips = []
-    for i, ev in enumerate(serves):
-        clip_start = max(0, ev["start_frame"] - pad)
-        clip_end = min(total - 1, ev["end_frame"] + pad)
-        clips.append((i, ev, clip_start, clip_end))
+    clips = [(i, ev, max(0, ev["start_frame"] - pad), min(total - 1, ev["end_frame"] + pad))
+             for i, ev in enumerate(serves)]
 
     max_needed = max(ce for _, _, _, ce in clips)
-    clip_idx = 0
-    fi = 0
+    clip_idx, fi = 0, 0
     while fi <= max_needed and clip_idx < len(clips):
         ret, frame = cap.read()
         if not ret:
@@ -361,14 +280,13 @@ def write_serve_review(src_video, serves, fps, dst_video, pad_seconds=0.5):
             clip_idx += 1
         if clip_idx >= len(clips):
             break
-        idx, ev, clip_start, clip_end = clips[clip_idx]
-        if clip_start <= fi <= clip_end:
+        idx, ev, cs, ce = clips[clip_idx]
+        if cs <= fi <= ce:
             label = "Serve %d/%d  %s  conf=%.2f  t=%.1fs" % (
                 idx + 1, len(serves), ev["slot_name"], ev["conf"], fi / fps)
-            cv2.putText(frame, label, (20, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+            cv2.putText(frame, label, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
             writer.write(frame)
-            if fi == clip_end:
+            if fi == ce:
                 clip_idx += 1
         fi += 1
 
@@ -384,21 +302,15 @@ def write_serve_review(src_video, serves, fps, dst_video, pad_seconds=0.5):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--players", required=True,
-                        help="player_detections.json from detect_players.py")
-    parser.add_argument("--calib", required=True, help="calib.json")
-    parser.add_argument("--video", required=True,
-                        help="Original video (for on-demand pose extraction)")
+    parser.add_argument("--players", required=True)
+    parser.add_argument("--calib", required=True)
     parser.add_argument("--gru", default="weights/stroke_gru_v6_best.pt")
-    parser.add_argument("--ball", default=None,
-                        help="ball_positions.json for toss filtering")
+    parser.add_argument("--ball", default=None)
+    parser.add_argument("--video", default=None, help="For serve_review.mp4 generation")
     parser.add_argument("--out", required=True)
-    parser.add_argument("--ready-duration", type=float, default=0.5,
-                        help="Seconds of scene stability for readiness")
+    parser.add_argument("--ready-duration", type=float, default=0.5)
     parser.add_argument("--serve-threshold", type=float, default=0.8)
-    parser.add_argument("--min-net-dist", type=float, default=8.0,
-                        help="Min distance from net (metres) to accept serve")
-    parser.add_argument("--no-half", action="store_true", help="Disable FP16")
+    parser.add_argument("--min-net-dist", type=float, default=8.0)
     args = parser.parse_args()
 
     # ---- Load inputs ----
@@ -407,89 +319,78 @@ def main():
     H_img_to_real = np.array(calib["H_img_to_real"], dtype=np.float64)
     mapper = SlotMapper(H_img_to_real)
     net_dir = compute_net_direction(H_img_to_real)
-    print(f"Calibration: {args.calib}")
 
-    print(f"Loading players: {args.players}")
     with open(args.players) as f:
         data = json.load(f)
     fps = data["fps"]
     frames = data["frames"]
     img_w = data.get("width", 1920)
-    print(f"  {data['total_frames']} frames, fps={fps:.1f}")
+    print(f"Players: {data['total_frames']} frames, fps={fps:.1f}")
 
     ball_det, ball_pred = {}, {}
     if args.ball:
-        print(f"Loading ball: {args.ball}")
         with open(args.ball) as f:
             ball_data = json.load(f)
         ball_det = ball_data.get("detected", {})
         ball_pred = ball_data.get("predicted", {})
-        print(f"  {len(ball_det)} detected, {len(ball_pred)} predicted")
+        print(f"Ball: {len(ball_det)} detected, {len(ball_pred)} predicted")
 
     # ---- Auto-detect singles/doubles ----
     n_players = detect_match_type(frames, mapper)
     min_ready_slots = max(n_players - 1, 2)
-    print(f"Match type: {'doubles' if n_players == 4 else 'singles'} "
-          f"({n_players} players, need {min_ready_slots}+ slots for readiness)")
+    print(f"Match: {'doubles' if n_players == 4 else 'singles'} "
+          f"(need {min_ready_slots}+ slots)")
 
     # ---- Load GRU v6 ----
-    print(f"Loading GRU: {args.gru}")
+    print(f"GRU: {args.gru}")
     gru = StrokeGRU(n_classes=4)
     gru.load_state_dict(torch.load(args.gru, map_location="cpu"))
     gru.eval()
 
-    # ---- Init ----
-    device = 0 if torch.cuda.is_available() else "cpu"
-    quantize = "fp16" if (torch.cuda.is_available() and not args.no_half) else None
-    pose = PoseExtractor(args.video, device, quantize)
-
+    # ---- Processing ----
     READY_FRAMES = int(round(args.ready_duration * fps))
     readiness = SceneReadiness(READY_FRAMES, min_slots=min_ready_slots)
     detector = ServeDetector(fps)
 
     scene_was_ready = False
-    serve_candidates = []  # (peak_frame, slot, gru_conf)
+    serve_candidates = []
     gru_count = 0
+    trigger_count = 0
     t0 = time.time()
 
     for fd in frames:
         fi = fd["frame"]
         slot_dets = mapper.assign(fd["detections"])
-
-        # Always update readiness
         readiness.update(fi, slot_dets)
         ready = readiness.is_ready(fi)
 
         if not ready:
             if scene_was_ready:
-                # Reset detector state on transition
                 for s in range(4):
-                    detector.state[s] = "IDLE"
-                    detector.raw_buf[s].clear()
+                    detector.reset_slot(s)
             scene_was_ready = False
             continue
 
         if not scene_was_ready:
             for s in range(4):
-                detector.state[s] = "IDLE"
-                detector.raw_buf[s].clear()
+                detector.reset_slot(s)
         scene_was_ready = True
 
-        # Extract pose for assigned slots
+        # Process each slot's keypoints
         for slot in sorted(slot_dets.keys()):
             det = slot_dets[slot]
-            raw_kp = pose.extract_single(fi, det)
-            if raw_kp is None:
+            if "kp_x" not in det:
                 continue
 
-            kp_x, kp_y, kp_v = raw_kp["kp_x"], raw_kp["kp_y"], raw_kp["kp_v"]
+            kp_x = np.array(det["kp_x"])
+            kp_y = np.array(det["kp_y"])
+            kp_v = np.array(det["kp_v"])
 
-            # Update serve detector state machine
             peak = detector.update(fi, slot, kp_x, kp_y, kp_v)
             if peak is None:
                 continue
 
-            # Peak detected — build window and run GRU
+            trigger_count += 1
             window, ok = detector.build_window(slot, peak)
             if not ok:
                 continue
@@ -503,24 +404,23 @@ def main():
 
             serve_p = float(probs[2])
             if serve_p > args.serve_threshold:
+                ds = detector.ds_interval
                 serve_candidates.append({
                     "peak_frame": peak,
-                    "start_frame": peak - int(BEFORE_PEAK * detector.ds_interval),
-                    "end_frame": peak + int(AFTER_PEAK * detector.ds_interval),
-                    "start_time": round((peak - int(BEFORE_PEAK * detector.ds_interval)) / fps, 2),
-                    "end_time": round((peak + int(AFTER_PEAK * detector.ds_interval)) / fps, 2),
+                    "start_frame": peak - int(BEFORE_PEAK * ds),
+                    "end_frame": peak + int(AFTER_PEAK * ds),
+                    "start_time": round((peak - int(BEFORE_PEAK * ds)) / fps, 2),
+                    "end_time": round((peak + int(AFTER_PEAK * ds)) / fps, 2),
                     "slot": slot,
                     "slot_name": SLOT_NAMES[slot],
                     "conf": round(serve_p, 3),
                 })
 
-        if fi > 0 and fi % 2000 == 0:
+        if fi > 0 and fi % 5000 == 0:
             e = time.time() - t0
             print(f"  frame {fi}/{len(frames)}  {fi/e:.1f} fps  "
-                  f"pose={pose.pose_count}  gru={gru_count}  "
+                  f"triggers={trigger_count}  gru={gru_count}  "
                   f"candidates={len(serve_candidates)}")
-
-    pose.close()
 
     # ---- Post-filtering ----
     def _get_ball(frame_idx):
@@ -528,36 +428,29 @@ def main():
         return ball_det.get(k) or ball_pred.get(k)
 
     def _filter_serve(ev):
-        mid_frame = ev["peak_frame"]
-        if mid_frame >= len(frames):
+        mid = ev["peak_frame"]
+        if mid >= len(frames):
             return True, ""
-        fd = frames[mid_frame]
+        fd = frames[mid]
         slot = ev["slot"]
-
         slot_dets = mapper.assign(fd["detections"])
         if slot not in slot_dets:
             return True, ""
         det = slot_dets[slot]
         foot_x, foot_y = det["foot_x"], det["foot_y"]
 
-        # 1. Net proximity
         rx, ry = mapper.to_court(foot_x, foot_y)
         if rx is not None and ry is not None:
-            dist_net = abs(ry - mapper.net_y_m)
-            if dist_net < args.min_net_dist:
-                return False, f"too close to net ({dist_net:.1f}m)"
-
-        # 2. Sideline
+            if abs(ry - mapper.net_y_m) < args.min_net_dist:
+                return False, f"too close to net ({abs(ry - mapper.net_y_m):.1f}m)"
         if rx is not None:
             if rx < -1.0 or rx > mapper.cfg.court_width_m + 1.0:
                 return False, f"outside sideline (rx={rx:.1f}m)"
 
-        # 3. Frame edge
         bbox = det["bbox"]
         if bbox[0] <= 1 or bbox[2] >= img_w - 1:
-            return False, "frame edge (incomplete body)"
+            return False, "frame edge"
 
-        # 4. Ball x-proximity
         if ball_det or ball_pred:
             search_start = max(0, ev["start_frame"])
             search_end = ev["end_frame"] + 1
@@ -571,16 +464,14 @@ def main():
             if min_x_diff < float("inf"):
                 bbox_w = bbox[2] - bbox[0]
                 if min_x_diff > max(bbox_w * 5, 300):
-                    return False, f"ball x too far (min_diff={min_x_diff:.0f}px)"
+                    return False, f"ball x too far ({min_x_diff:.0f}px)"
 
-        # 5. Ball toss
         if ball_det or ball_pred:
-            toss_ok, toss_reason = check_serve_toss(
+            toss_ok, reason = check_serve_toss(
                 _get_ball, ev["start_frame"], ev["end_frame"],
-                foot_x, foot_y, bbox, fps, net_dir=net_dir,
-            )
+                foot_x, foot_y, bbox, fps, net_dir=net_dir)
             if not toss_ok:
-                return False, toss_reason
+                return False, reason
 
         return True, ""
 
@@ -592,13 +483,13 @@ def main():
         else:
             print(f"  Filtered: {ev['start_time']}s {ev['slot_name']} - {reason}")
 
-    # ---- Print results ----
+    # ---- Results ----
     elapsed = time.time() - t0
     print(f"\nDone in {elapsed:.0f}s")
-    print(f"  Pose extractions: {pose.pose_count}")
-    print(f"  Hand-above-head triggers: {gru_count}")
-    print(f"  Serve candidates (pre-filter): {len(serve_candidates)}")
-    print(f"  Serve events (post-filter): {len(filtered)}")
+    print(f"  Hand-above-head triggers: {trigger_count}")
+    print(f"  GRU calls: {gru_count}")
+    print(f"  Candidates (pre-filter): {len(serve_candidates)}")
+    print(f"  Serves (post-filter): {len(filtered)}")
 
     from collections import Counter
     slots = Counter(s["slot_name"] for s in filtered)
@@ -606,7 +497,6 @@ def main():
         if slots[slot]:
             print(f"    {slot}: {slots[slot]}")
 
-    print(f"\nServe events:")
     for s in filtered:
         print(f"  {s['start_time']}s-{s['end_time']}s {s['slot_name']} conf={s['conf']}")
 
@@ -624,7 +514,7 @@ def main():
         "stats": {
             "total_frames": len(frames),
             "fps": fps,
-            "pose_extractions": pose.pose_count,
+            "triggers": trigger_count,
             "gru_calls": gru_count,
         },
         "serve_events": filtered,
@@ -633,8 +523,7 @@ def main():
         json.dump(output, f, indent=2)
     print(f"\nSaved: {args.out}")
 
-    # ---- Serve review ----
-    if filtered:
+    if args.video and filtered:
         review_path = os.path.join(os.path.dirname(args.out) or ".", "serve_review.mp4")
         print(f"\nGenerating serve review: {review_path}")
         write_serve_review(args.video, filtered, fps, review_path)
