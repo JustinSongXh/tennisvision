@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
-"""Extract player keypoints from video using two-stage YOLO pipeline.
+"""Detect, track and extract pose for players per frame.
 
-Stage 1: yolo11m full-frame person detection + tracking
-Stage 2: yolo26s-pose on each bbox crop for keypoints
+Two-stage pipeline:
+  Stage 1: yolo11m full-frame person detection + tracking
+  Stage 2: yolo26s-pose on each bbox crop for keypoints
 
-Outputs keypoints.json with per-frame detections including normalized keypoints.
+Outputs player_detections.json with bbox, foot position, and raw keypoints
+(pixel coordinates, not normalized). Normalization is done by consumers
+(detect_serves, classify_actions) according to their own needs.
 
 Usage:
-    python -u scripts/extract_keypoints.py \
-        --video samples/sample_short.mp4 \
-        --out results/sample_short/keypoints.json
+    python -u scripts/detect_players.py \
+        --video samples/sample3.mp4 \
+        --out results/sample3/player_detections.json
 
     # Limit frames
-    python -u scripts/extract_keypoints.py \
-        --video samples/sample_short.mp4 \
-        --out results/sample_short/keypoints.json \
+    python -u scripts/detect_players.py \
+        --video samples/sample3.mp4 \
+        --out results/sample3/player_detections.json \
         --max-frames 1800
-
-    # Disable FP16
-    python -u scripts/extract_keypoints.py \
-        --video samples/sample_short.mp4 \
-        --out results/sample_short/keypoints.json \
-        --no-half
 """
 
 from __future__ import annotations
@@ -50,7 +47,6 @@ def main():
 
     from ultralytics import YOLO
 
-    # Hardware auto-detection
     if torch.cuda.device_count() >= 2:
         det_device, pose_device = 0, 1
     elif torch.cuda.is_available():
@@ -106,31 +102,35 @@ def main():
                 if j >= len(prs):
                     continue
                 pr = prs[j]
-                if pr.boxes is None or len(pr.boxes) == 0 or pr.keypoints is None:
-                    continue
-                best = int(pr.boxes.conf.cpu().numpy().argmax())
-                kp = pr.keypoints.data[best].cpu().numpy()
-                kp_x = kp[:, 0] + offsets[j][0]
-                kp_y = kp[:, 1] + offsets[j][1]
-                kp_v = kp[:, 2]
-                valid = kp_v >= 0.3
-                if valid.sum() < 3:
-                    continue
-                xn, xx = kp_x[valid].min(), kp_x[valid].max()
-                yn, yx = kp_y[valid].min(), kp_y[valid].max()
-                bw, bh = max(xx - xn, 1), max(yx - yn, 1)
-                detections.append({
-                    "tid": int(ids[i]), "det_conf": round(float(confs[i]), 3),
-                    "bbox": [int(boxes[i][0]), int(boxes[i][1]),
-                             int(boxes[i][2]), int(boxes[i][3])],
-                    "foot_x": round(float((boxes[i][0] + boxes[i][2]) / 2), 1),
-                    "foot_y": int(boxes[i][3]),
-                    "kp_x": [round(float(v), 4) for v in kp_x],
-                    "kp_y": [round(float(v), 4) for v in kp_y],
-                    "kp_v": [round(float(v), 3) for v in kp_v],
-                    "kp_norm_x": [round(float((kp_x[k] - xn) / bw), 4) for k in range(17)],
-                    "kp_norm_y": [round(float((kp_y[k] - yn) / bh), 4) for k in range(17)],
-                })
+                has_kp = (pr.boxes is not None and len(pr.boxes) > 0
+                          and pr.keypoints is not None)
+                if has_kp:
+                    best = int(pr.boxes.conf.cpu().numpy().argmax())
+                    kp = pr.keypoints.data[best].cpu().numpy()
+                    kp_x = kp[:, 0] + offsets[j][0]
+                    kp_y = kp[:, 1] + offsets[j][1]
+                    kp_v = kp[:, 2]
+                    det = {
+                        "tid": int(ids[i]),
+                        "det_conf": round(float(confs[i]), 3),
+                        "bbox": [int(boxes[i][0]), int(boxes[i][1]),
+                                 int(boxes[i][2]), int(boxes[i][3])],
+                        "foot_x": round(float((boxes[i][0] + boxes[i][2]) / 2), 1),
+                        "foot_y": int(boxes[i][3]),
+                        "kp_x": [round(float(v), 1) for v in kp_x],
+                        "kp_y": [round(float(v), 1) for v in kp_y],
+                        "kp_v": [round(float(v), 3) for v in kp_v],
+                    }
+                else:
+                    det = {
+                        "tid": int(ids[i]),
+                        "det_conf": round(float(confs[i]), 3),
+                        "bbox": [int(boxes[i][0]), int(boxes[i][1]),
+                                 int(boxes[i][2]), int(boxes[i][3])],
+                        "foot_x": round(float((boxes[i][0] + boxes[i][2]) / 2), 1),
+                        "foot_y": int(boxes[i][3]),
+                    }
+                detections.append(det)
 
         frame_data.append({"frame": fi, "detections": detections})
         fi += 1

@@ -162,7 +162,12 @@ def _find_peak(kp_seq):
 
 
 def _normalize_seq(kp_seq):
-    """Apply uniform-scale bbox-relative normalization per frame."""
+    """Apply independent bw/bh bbox-relative normalization per frame.
+
+    Maps keypoints to [0,1]×[0,1] regardless of aspect ratio.
+    This "stretching" eliminates domain gap between THETIS (close-up)
+    and real match footage (far-court narrow players).
+    """
     kp_seq = kp_seq.copy()
     for i in range(len(kp_seq)):
         valid = kp_seq[i][:, 2] > 0.3
@@ -173,9 +178,8 @@ def _normalize_seq(kp_seq):
             ymax = kp_seq[i][valid, 1].max()
             bw = max(xmax - xmin, 1)
             bh = max(ymax - ymin, 1)
-            scale = max(bw, bh)
-            kp_seq[i][:, 0] = (kp_seq[i][:, 0] - xmin) / scale
-            kp_seq[i][:, 1] = (kp_seq[i][:, 1] - ymin) / scale
+            kp_seq[i][:, 0] = (kp_seq[i][:, 0] - xmin) / bw
+            kp_seq[i][:, 1] = (kp_seq[i][:, 1] - ymin) / bh
     return kp_seq
 
 
