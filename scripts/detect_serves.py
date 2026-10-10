@@ -216,8 +216,11 @@ def main():
     READY_FRAMES = int(round(args.ready_duration * fps))
     readiness = SceneReadiness(READY_FRAMES, min_slots=min_ready_slots)
 
-    # Per-slot state
+    MAX_MISSING_RATIO = 0.2  # >20% missing → skip GRU
+
+    # Per-slot state: buffer stores (frame_idx, kp_array) tuples
     kp_buffers = {s: [] for s in range(4)}
+    BUF_MAX = SEQ_LEN + 30
     prev_kps = {s: None for s in range(4)}
     active = {s: False for s in range(4)}
     gap_count = {s: 0 for s in range(4)}
@@ -271,9 +274,9 @@ def main():
             if kp is None:
                 continue
 
-            kp_buffers[slot].append(kp)
-            if len(kp_buffers[slot]) > SEQ_LEN + 30:
-                kp_buffers[slot] = kp_buffers[slot][-(SEQ_LEN + 30):]
+            kp_buffers[slot].append((fi, kp))
+            if len(kp_buffers[slot]) > BUF_MAX:
+                kp_buffers[slot] = kp_buffers[slot][-BUF_MAX:]
 
             # Wrist speed trigger
             speed = 0.0
@@ -291,10 +294,41 @@ def main():
                 if gap_count[slot] > args.gap_tolerance:
                     active[slot] = False
 
-            # GRU during active period
-            if active[slot] and len(kp_buffers[slot]) >= SEQ_LEN:
+            # GRU during active period — build 30-frame window with interpolation
+            if active[slot] and len(kp_buffers[slot]) >= SEQ_LEN // 2:
+                # Target: fi-29 to fi (30 consecutive frames)
+                start_fi = fi - SEQ_LEN + 1
+                frame_map = {f: k for f, k in kp_buffers[slot] if f >= start_fi}
+
+                if len(frame_map) < SEQ_LEN * (1 - MAX_MISSING_RATIO):
+                    continue  # too many missing
+
+                # Build with interpolation
+                window = []
+                sorted_keys = sorted(frame_map.keys())
+                skip = False
+                for t in range(start_fi, fi + 1):
+                    if t in frame_map:
+                        window.append(frame_map[t])
+                    else:
+                        before = [f for f in sorted_keys if f < t]
+                        after = [f for f in sorted_keys if f > t]
+                        if before and after:
+                            bf, af = before[-1], after[0]
+                            alpha = (t - bf) / (af - bf)
+                            window.append(frame_map[bf] * (1 - alpha) + frame_map[af] * alpha)
+                        elif before:
+                            window.append(frame_map[before[-1]])
+                        elif after:
+                            window.append(frame_map[after[0]])
+                        else:
+                            skip = True
+                            break
+                if skip or len(window) != SEQ_LEN:
+                    continue
+
                 feat = np.array(
-                    [k[:, :2].reshape(-1) for k in kp_buffers[slot][-SEQ_LEN:]],
+                    [k[:, :2].reshape(-1) for k in window],
                     dtype=np.float32,
                 )
                 with torch.no_grad():
