@@ -279,18 +279,20 @@ class StrokeDataset(Dataset):
             feat = window[:, :, :2].reshape(SEQ_LEN, -1)
             self.samples.append((feat.astype(np.float32), LABEL2IDX[label]))
 
-            # Background sample: middle of the non-peak region
+            # Background samples: windows centered far from peak
+            # Use _extract_window which handles edge padding
             n = len(norm_seq)
-            if peak >= SEQ_LEN:
-                # Background from the beginning
-                bg_window = norm_seq[:SEQ_LEN]
-                feat = bg_window[:, :, :2].reshape(SEQ_LEN, -1)
+            # Background at video start (centered at frame BEFORE_PEAK//2)
+            bg_center_start = min(BEFORE_PEAK // 2, max(0, peak - BEFORE_PEAK - SEQ_LEN // 2))
+            if abs(bg_center_start - peak) > SEQ_LEN // 2:
+                bg = _extract_window(norm_seq, bg_center_start)
+                feat = bg[:, :, :2].reshape(SEQ_LEN, -1)
                 self.samples.append((feat.astype(np.float32), LABEL2IDX['background']))
-            if peak + AFTER_PEAK + SEQ_LEN <= n:
-                # Background from after the action
-                bg_start = peak + AFTER_PEAK + 1
-                bg_window = norm_seq[bg_start:bg_start + SEQ_LEN]
-                feat = bg_window[:, :, :2].reshape(SEQ_LEN, -1)
+            # Background at video end
+            bg_center_end = max(n - 1 - AFTER_PEAK // 2, min(n - 1, peak + AFTER_PEAK + SEQ_LEN // 2))
+            if abs(bg_center_end - peak) > SEQ_LEN // 2:
+                bg = _extract_window(norm_seq, bg_center_end)
+                feat = bg[:, :, :2].reshape(SEQ_LEN, -1)
                 self.samples.append((feat.astype(np.float32), LABEL2IDX['background']))
 
     def __len__(self):
