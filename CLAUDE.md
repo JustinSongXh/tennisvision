@@ -8,12 +8,15 @@ Tennis video analysis pipeline: court calibration, ball detection & tracking, pl
 
 ```
 scripts/          CLI entry points
-  run_full_pipeline.py   5-step orchestrator (primary workflow)
+  run_full_pipeline.py   6-step orchestrator (primary workflow)
   calibrate.py           Court calibration
-  extract_keypoints.py   Player detection + pose (yolo11m + yolo26s-pose)
   extract_ball_positions.py  Ball detection + Kalman tracker (WASB HRNet)
-  detect_serves.py       GRU v4 serve classification
+  detect_players.py      Player detection + pose (yolo11m + yolo26s-pose)
+  detect_serves.py       Scene readiness + GRU v4 serve classification
   detect_rallies.py      Rally fusion + video cutting
+  classify_actions.py    Rally-internal action classification (optional)
+  train_stroke_gru.py    GRU training on THETIS dataset
+  extract_keypoints.py   Legacy keypoint extraction (superseded by detect_players.py)
   analyze.py             Integrated two-pass pipeline (with rendering)
 tennisvision/     Main package
   ball/           Ball detection (WASB HRNet, classical HSV) + Kalman tracker + InpaintNet
@@ -48,11 +51,16 @@ docs/             Design docs and surveys
 
 ### Running the pipeline
 
-Standalone 5-step pipeline (primary):
+Standalone 6-step pipeline (primary):
 ```bash
 python scripts/run_full_pipeline.py \
-    --video samples/sample2.mp4 \
+    --video samples/sample3.mp4 \
     --weights-dir weights/
+
+# With optional action classification (Step 6)
+python scripts/run_full_pipeline.py \
+    --video samples/sample3.mp4 \
+    --weights-dir weights/ --with-actions
 ```
 
 Integrated two-pass pipeline (with rendering):
@@ -98,11 +106,22 @@ Defaults in `tennisvision/config.py` DEFAULTS dict. Override via YAML files in `
 ### Standalone pipeline (run_full_pipeline.py)
 
 ```
-Step 1: calibrate.py        → calib.json (court homography)
-Step 2: extract_keypoints.py → keypoints.json (player pose per frame)
-Step 3: extract_ball_positions.py → ball_positions.json (ball trajectory)
-Step 4: detect_serves.py    → serve_events.json (GRU v4 + filtering)
-Step 5: detect_rallies.py   → rally_events.json + rally_cuts.mp4
+Step 1: calibrate.py              → calib.json (court homography)
+Step 2: extract_ball_positions.py  → ball_positions.json (ball trajectory)
+Step 3: detect_players.py          → player_detections.json (bbox + raw keypoints)
+Step 4: detect_serves.py           → serve_events.json
+         ├ Scene readiness (3+ slots stable 0.5s)
+         ├ Auto singles/doubles detection
+         ├ v4-style GRU (wrist speed trigger, 30-frame sliding window)
+         ├ v4 normalization (x/bw, y/bh)
+         ├ Interpolation for missing frames
+         └ Post-filters (net distance, ball toss, frame edge)
+Step 5: detect_rallies.py          → rally_events.json + rally_cuts.mp4
+Step 6: classify_actions.py        → action_events.json (optional, --with-actions)
+```
+
+Steps 2 and 3 are independent (could run in parallel).
+Step 3 is GPU-intensive (every frame). Steps 4-6 are CPU-only (read JSON).
 ```
 
 ### Integrated pipeline (analyze.py)
@@ -120,9 +139,9 @@ Pass 2:  re-read video -> render overlays -> write annotated output + rally cuts
 |------|--------|-------|
 | `court_resnet.pth` | Court calibration | ResNet50, 14-point regression |
 | `wasb_tennis_best.pth.tar` | Ball detection | WASB HRNet, auto-exports .onnx |
-| `stroke_gru_v4_best.pt` | Serve detection | GRU v4, 4-class (standalone pipeline) |
+| `stroke_gru_v4_best.pt` | Serve detection | GRU v4, 4-class, v4 normalization (x/bw, y/bh) |
 | `bounce_catboost.cbm` | Bounce detection | CatBoost classifier |
-| `yolo26s-pose.pt` | Keypoint extraction | YOLO26s-pose (standalone pipeline) |
+| `yolo26s-pose.pt` | Player pose | YOLO26s-pose (detect_players.py, Step 3) |
 | `yolo26n-pose.pt` | Player pose | YOLO26n-pose (analyze.py pipeline) |
 | `tennis_rnn.h5` | Stroke classification | Keras GRU (analyze.py pipeline) |
 | `InpaintNet_best.pt` | Trajectory inpainting | TrackNetV3, optional |
