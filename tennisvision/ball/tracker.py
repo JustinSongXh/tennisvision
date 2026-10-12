@@ -76,6 +76,26 @@ class Track:
             t += (p1.frame - p0.frame)
         return d / max(t, 1)
 
+    def projectile_residual(self, window: int = 15) -> float:
+        """Mean residual of a parabolic fit on recent points.
+
+        Fits x(t) = a0 + a1*t (linear) and y(t) = b0 + b1*t + b2*t^2
+        (quadratic, gravity) and returns the mean Euclidean residual.
+        Returns 0.0 if there are too few points for a reliable fit.
+        """
+        pts = self.pts[-window:]
+        if len(pts) < 5:
+            return 0.0
+        t0 = pts[0].frame
+        ts = np.array([p.frame - t0 for p in pts], dtype=np.float64)
+        xs = np.array([p.x for p in pts], dtype=np.float64)
+        ys = np.array([p.y for p in pts], dtype=np.float64)
+        cx = np.polyfit(ts, xs, 1)
+        x_fit = np.polyval(cx, ts)
+        cy = np.polyfit(ts, ys, 2)
+        y_fit = np.polyval(cy, ts)
+        return float(np.mean(np.hypot(x_fit - xs, y_fit - ys)))
+
 
 @dataclass
 class TrackerConfig:
@@ -139,5 +159,13 @@ class MultiTrackManager:
                  if t.validated and frame_idx - t.last_det_frame <= self.cfg.max_gap_frames]
         if not cands:
             return None
-        cands.sort(key=lambda t: (len(t.pts), -(frame_idx - t.last_det_frame)), reverse=True)
+        cands.sort(key=lambda t: self._champion_score(t, frame_idx), reverse=True)
         return cands[0]
+
+    @staticmethod
+    def _champion_score(t: Track, frame_idx: int) -> float:
+        residual = t.projectile_residual()
+        n = len(t.pts)
+        score = n / (1.0 + residual)
+        age = frame_idx - t.last_det_frame
+        return score - age * 0.01
