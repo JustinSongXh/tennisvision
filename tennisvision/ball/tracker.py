@@ -44,6 +44,9 @@ class TrackerConfig:
     # Pixel-space fallback (px/frame), used when no homography
     min_speed_px: float = 5.0
     max_speed_px: float = 200.0
+    # Displacement below this (meters) marks track as static
+    static_threshold_m: float = 0.5
+    static_window: int = 10
     render_tail: int = 45
 
 
@@ -57,6 +60,7 @@ class Track:
         self.pts: list[TrackPoint] = [TrackPoint(x, y, frame)]
         self.last_det_frame = frame
         self.validated = False
+        self.is_static = False
         self.pred_xy: tuple[float, float] = (float(x), float(y))
         self._cfg = cfg
         self._H = H
@@ -95,6 +99,24 @@ class Track:
                 lo, hi = self._cfg.min_speed_px, self._cfg.max_speed_px
             if lo <= s <= hi:
                 self.validated = True
+        self._update_static()
+
+    def _update_static(self) -> None:
+        """Mark track static if recent displacement < threshold."""
+        w = self._cfg.static_window
+        recent = self.pts[-w:]
+        if len(recent) < 3:
+            self.is_static = False
+            return
+        p0, p1 = recent[0], recent[-1]
+        if self._H is not None:
+            c0 = _px_to_court(p0.x, p0.y, self._H)
+            c1 = _px_to_court(p1.x, p1.y, self._H)
+            disp = float(np.hypot(c1[0] - c0[0], c1[1] - c0[1]))
+            self.is_static = disp < self._cfg.static_threshold_m
+        else:
+            disp = float(np.hypot(p1.x - p0.x, p1.y - p0.y))
+            self.is_static = disp < 5.0
 
     def avg_speed_px(self) -> float:
         """Average speed in px/frame."""
@@ -194,7 +216,8 @@ class MultiTrackManager:
 
     def champion(self, frame_idx: int) -> Optional[Track]:
         cands = [t for t in self.tracks
-                 if t.validated and frame_idx - t.last_det_frame <= self.cfg.max_gap_frames]
+                 if t.validated and not t.is_static
+                 and frame_idx - t.last_det_frame <= self.cfg.max_gap_frames]
         if not cands:
             return None
         cands.sort(key=lambda t: self._champion_score(t, frame_idx), reverse=True)
