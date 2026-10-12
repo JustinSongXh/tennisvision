@@ -2,14 +2,19 @@
 
 One Track per candidate cluster; per-frame greedy nearest-neighbour
 association; Kalman-predicted position drives the gating.  Tracks get
-validated once they have >= MIN_LEN observations whose average image
-speed is in [MIN_SPEED, MAX_SPEED] px/frame — this simultaneously
-rejects (a) vibrating-pixel noise and (b) teleporting false matches.
+validated once they have >= MIN_LEN observations whose average speed
+passes a threshold check.  Champion selection uses projectile-residual
+scoring: score = n_points / (1 + residual), so noise tracks with high
+residual lose even if they have many points.
+
+When a homography (H_img_to_real) is provided, speed validation operates
+in court-coordinate meters instead of pixels, eliminating perspective
+distortion between near and far court.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import cv2
@@ -23,19 +28,39 @@ class TrackPoint:
     frame: int
 
 
+def _px_to_court(x: float, y: float, H: np.ndarray) -> tuple[float, float]:
+    p = H @ np.array([x, y, 1.0], dtype=np.float64)
+    return float(p[0] / p[2]), float(p[1] / p[2])
+
+
+@dataclass
+class TrackerConfig:
+    gate_px: float = 80.0
+    max_gap_frames: int = 5
+    min_len: int = 3
+    # Court-coordinate speed thresholds (m/s), used when homography available
+    min_speed_ms: float = 3.0
+    max_speed_ms: float = 90.0
+    # Pixel-space fallback (px/frame), used when no homography
+    min_speed_px: float = 5.0
+    max_speed_px: float = 200.0
+    render_tail: int = 45
+
+
 class Track:
     _next_id = 0
 
-    def __init__(self, x: int, y: int, frame: int, min_len: int, min_speed: float, max_speed: float):
+    def __init__(self, x: int, y: int, frame: int, cfg: TrackerConfig,
+                 H: Optional[np.ndarray] = None, fps: float = 30.0):
         self.id = Track._next_id
         Track._next_id += 1
         self.pts: list[TrackPoint] = [TrackPoint(x, y, frame)]
         self.last_det_frame = frame
         self.validated = False
         self.pred_xy: tuple[float, float] = (float(x), float(y))
-        self._min_len = min_len
-        self._min_speed = min_speed
-        self._max_speed = max_speed
+        self._cfg = cfg
+        self._H = H
+        self._fps = fps
 
         kf = cv2.KalmanFilter(4, 2)
         kf.transitionMatrix = np.array([
@@ -61,12 +86,18 @@ class Track:
         self.kf.correct(np.array([[np.float32(x)], [np.float32(y)]], dtype=np.float32))
         self.pts.append(TrackPoint(x, y, frame))
         self.last_det_frame = frame
-        if not self.validated and len(self.pts) >= self._min_len:
-            s = self.avg_speed()
-            if self._min_speed <= s <= self._max_speed:
+        if not self.validated and len(self.pts) >= self._cfg.min_len:
+            if self._H is not None:
+                s = self.avg_speed_ms()
+                lo, hi = self._cfg.min_speed_ms, self._cfg.max_speed_ms
+            else:
+                s = self.avg_speed_px()
+                lo, hi = self._cfg.min_speed_px, self._cfg.max_speed_px
+            if lo <= s <= hi:
                 self.validated = True
 
-    def avg_speed(self) -> float:
+    def avg_speed_px(self) -> float:
+        """Average speed in px/frame."""
         if len(self.pts) < 2:
             return 0.0
         d = 0.0; t = 0
@@ -75,6 +106,19 @@ class Track:
             d += float(np.hypot(p1.x - p0.x, p1.y - p0.y))
             t += (p1.frame - p0.frame)
         return d / max(t, 1)
+
+    def avg_speed_ms(self) -> float:
+        """Average speed in m/s using court-coordinate projection."""
+        if len(self.pts) < 2 or self._H is None:
+            return 0.0
+        d = 0.0; t = 0
+        for i in range(1, len(self.pts)):
+            p1 = self.pts[i]; p0 = self.pts[i - 1]
+            cx1, cy1 = _px_to_court(p1.x, p1.y, self._H)
+            cx0, cy0 = _px_to_court(p0.x, p0.y, self._H)
+            d += float(np.hypot(cx1 - cx0, cy1 - cy0))
+            t += (p1.frame - p0.frame)
+        return d / max(t, 1) * self._fps
 
     def projectile_residual(self, window: int = 15) -> float:
         """Mean residual of a parabolic fit on recent points.
@@ -97,20 +141,14 @@ class Track:
         return float(np.mean(np.hypot(x_fit - xs, y_fit - ys)))
 
 
-@dataclass
-class TrackerConfig:
-    gate_px: float = 80.0
-    max_gap_frames: int = 5
-    min_len: int = 3
-    min_speed: float = 10.0
-    max_speed: float = 150.0
-    render_tail: int = 45
-
-
 class MultiTrackManager:
-    def __init__(self, cfg: TrackerConfig):
+    def __init__(self, cfg: TrackerConfig, *,
+                 H_img_to_real: Optional[np.ndarray] = None,
+                 fps: float = 30.0):
         self.cfg = cfg
         self.tracks: list[Track] = []
+        self._H = H_img_to_real
+        self._fps = fps
 
     def update(self, candidates: list[tuple[int, int]], frame_idx: int) -> None:
         active = [t for t in self.tracks
@@ -137,8 +175,8 @@ class MultiTrackManager:
         for i, (cx, cy) in enumerate(candidates):
             if i not in used:
                 self.tracks.append(Track(
-                    cx, cy, frame_idx,
-                    self.cfg.min_len, self.cfg.min_speed, self.cfg.max_speed,
+                    cx, cy, frame_idx, self.cfg,
+                    H=self._H, fps=self._fps,
                 ))
 
         # Pruning: validated tracks stay for render_tail frames so the

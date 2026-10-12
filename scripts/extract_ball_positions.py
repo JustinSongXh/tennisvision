@@ -24,6 +24,7 @@ import sys
 import time
 
 import cv2
+import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -40,6 +41,8 @@ def main():
     parser.add_argument("--device", default=None)
     parser.add_argument("--weights", default=None,
                         help="WASB weights path (overrides config)")
+    parser.add_argument("--calib", default=None,
+                        help="calib.json for court-coordinate speed validation")
     parser.add_argument("--max-frames", type=int, default=0,
                         help="Limit frames (0=all)")
     args = parser.parse_args()
@@ -50,6 +53,14 @@ def main():
     device = args.device or bcfg.get("device", "cpu")
     weights = args.weights or bcfg["weights"]
 
+    # Load homography for court-coordinate speed validation
+    H_img_to_real = None
+    if args.calib:
+        with open(args.calib) as f:
+            calib_data = json.load(f)
+        H_img_to_real = np.array(calib_data["H_img_to_real"], dtype=np.float64)
+        print(f"Calib loaded: {args.calib} (court-coordinate speed validation)")
+
     det = WASBBallDetector(WASBConfig(
         weights=weights,
         device=device,
@@ -57,16 +68,18 @@ def main():
         score_threshold=bcfg.get("score_threshold", 0.5),
     ))
 
+    cap = cv2.VideoCapture(args.video)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
     tracker = MultiTrackManager(TrackerConfig(
         gate_px=tcfg.get("gate_px", 120),
         max_gap_frames=tcfg.get("max_gap_frames", 8),
         min_len=tcfg.get("min_len", 3),
-        min_speed=tcfg.get("min_speed", 5.0),
-        max_speed=tcfg.get("max_speed", 200.0),
-    ))
-
-    cap = cv2.VideoCapture(args.video)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        min_speed_ms=tcfg.get("min_speed_ms", 3.0),
+        max_speed_ms=tcfg.get("max_speed_ms", 90.0),
+        min_speed_px=tcfg.get("min_speed_px", 5.0),
+        max_speed_px=tcfg.get("max_speed_px", 200.0),
+    ), H_img_to_real=H_img_to_real, fps=fps)
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))

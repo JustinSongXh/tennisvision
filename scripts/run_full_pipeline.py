@@ -99,12 +99,15 @@ def step2_ball(video_path, out_dir, weights_dir, config_path, max_frames):
         print(f"  Already exists: {out_path}")
         return True
 
+    calib_path = os.path.join(out_dir, "calib.json")
     args = [
         "--video", video_path,
         "--out", out_path,
         "--weights", os.path.join(weights_dir, "wasb_tennis_best.pth.tar"),
         "--device", "cuda" if _HAS_CUDA else "cpu",
     ]
+    if os.path.exists(calib_path):
+        args += ["--calib", calib_path]
     if config_path:
         args += ["--config", config_path]
     if max_frames > 0:

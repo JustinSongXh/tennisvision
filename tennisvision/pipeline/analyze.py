@@ -216,7 +216,7 @@ def _maybe_inpaint(tracks: list, icfg: dict, frame_size: tuple) -> tuple:
             total_coverage_after += len(t.pts)
             continue
         fake = Track(pts[0].x, pts[0].y, pts[0].frame,
-                     min_len=1, min_speed=0.0, max_speed=1e9)
+                     TrackerConfig(min_len=1, min_speed_px=0.0, max_speed_px=1e9))
         fake.pts = list(pts)
         fake.validated = True
         new_tracks.append(fake)
@@ -386,9 +386,12 @@ def run(
     ball_det, ball_detect_fn = _build_ball_detector(bcfg, calib=calib)
     tracker = MultiTrackManager(TrackerConfig(
         gate_px=tcfg["gate_px"], max_gap_frames=tcfg["max_gap_frames"],
-        min_len=tcfg["min_len"], min_speed=tcfg["min_speed"],
-        max_speed=tcfg["max_speed"], render_tail=tcfg["render_tail"],
-    ))
+        min_len=tcfg["min_len"],
+        min_speed_px=tcfg.get("min_speed", 5.0),
+        max_speed_px=tcfg.get("max_speed", 200.0),
+        render_tail=tcfg["render_tail"],
+    ), H_img_to_real=getattr(calib, 'H_img_to_real', None) if calib else None,
+       fps=fps)
 
     rcfg = cfg["render"]
     minimap = Minimap(MinimapConfig(
