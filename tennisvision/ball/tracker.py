@@ -47,6 +47,10 @@ class TrackerConfig:
     # Displacement below this (meters) marks track as static
     static_threshold_m: float = 0.5
     static_window: int = 10
+    # Tracklet stitching (offline post-pass)
+    stitch_max_gap_s: float = 0.5       # max gap in seconds
+    stitch_pos_threshold: float = 80.0   # max position error in pixels
+    stitch_vel_angle_deg: float = 45.0   # max velocity angle difference
     render_tail: int = 45
 
 
@@ -162,6 +166,40 @@ class Track:
         y_fit = np.polyval(cy, ts)
         return float(np.mean(np.hypot(x_fit - xs, y_fit - ys)))
 
+    def _exit_state(self, window: int = 8) -> Optional[tuple]:
+        """Parabolic coefficients and exit velocity from last `window` points.
+
+        Returns (coeffs, velocity) where:
+          coeffs = (cx_poly1, cy_poly2) for extrapolation
+          velocity = (vx, vy) in px/frame at the last point
+        Returns None if too few points.
+        """
+        pts = self.pts[-window:]
+        if len(pts) < 4:
+            return None
+        t0 = pts[0].frame
+        ts = np.array([p.frame - t0 for p in pts], dtype=np.float64)
+        xs = np.array([p.x for p in pts], dtype=np.float64)
+        ys = np.array([p.y for p in pts], dtype=np.float64)
+        cx = np.polyfit(ts, xs, 1)
+        cy = np.polyfit(ts, ys, 2)
+        t_last = ts[-1]
+        vx = cx[0]
+        vy = 2 * cy[0] * t_last + cy[1]
+        return (cx, cy), np.array([vx, vy])
+
+    def _entry_velocity(self, window: int = 4) -> Optional[np.ndarray]:
+        """Velocity (vx, vy) in px/frame at the first point."""
+        pts = self.pts[:window]
+        if len(pts) < 2:
+            return None
+        dt = pts[-1].frame - pts[0].frame
+        if dt == 0:
+            return None
+        vx = (pts[-1].x - pts[0].x) / dt
+        vy = (pts[-1].y - pts[0].y) / dt
+        return np.array([vx, vy])
+
 
 class MultiTrackManager:
     def __init__(self, cfg: TrackerConfig, *,
@@ -230,3 +268,81 @@ class MultiTrackManager:
         score = n / (1.0 + residual)
         age = frame_idx - t.last_det_frame
         return score - age * 0.01
+
+    def stitch_tracklets(self) -> int:
+        """Offline post-pass: merge broken tracklets via projectile extrapolation.
+
+        For each gap between validated tracklets A (ends) and B (starts),
+        extrapolate A's parabolic arc to B's start frame. If position error
+        and velocity angle are within thresholds, merge B into A.
+
+        Returns the number of merges performed.
+        """
+        max_gap = int(round(self.cfg.stitch_max_gap_s * self._fps))
+        pos_thr = self.cfg.stitch_pos_threshold
+        ang_thr = self.cfg.stitch_vel_angle_deg
+
+        validated = [t for t in self.tracks if t.validated and len(t.pts) >= 4]
+        if len(validated) < 2:
+            return 0
+
+        validated.sort(key=lambda t: t.pts[-1].frame)
+
+        merged_ids: set[int] = set()
+        n_merges = 0
+
+        for i, a in enumerate(validated):
+            if a.id in merged_ids:
+                continue
+            for j in range(i + 1, len(validated)):
+                b = validated[j]
+                if b.id in merged_ids:
+                    continue
+
+                a_end = a.pts[-1].frame
+                b_start = b.pts[0].frame
+                gap = b_start - a_end
+                if gap <= 0 or gap > max_gap:
+                    continue
+
+                exit_state = a._exit_state()
+                if exit_state is None:
+                    continue
+                (cx, cy), vel_a = exit_state
+
+                vel_b = b._entry_velocity()
+                if vel_b is None:
+                    continue
+
+                # Velocity angle check
+                dot = float(np.dot(vel_a, vel_b))
+                na = float(np.linalg.norm(vel_a))
+                nb = float(np.linalg.norm(vel_b))
+                if na < 1e-6 or nb < 1e-6:
+                    continue
+                cos_ang = np.clip(dot / (na * nb), -1.0, 1.0)
+                angle_deg = float(np.degrees(np.arccos(cos_ang)))
+                if angle_deg > ang_thr:
+                    continue
+
+                # Position extrapolation check
+                t0_a = a.pts[-len(a.pts[-8:]):][0].frame
+                dt = b_start - t0_a
+                x_pred = float(np.polyval(cx, dt))
+                y_pred = float(np.polyval(cy, dt))
+                bx, by = b.pts[0].x, b.pts[0].y
+                pos_err = float(np.hypot(x_pred - bx, y_pred - by))
+                if pos_err > pos_thr:
+                    continue
+
+                # Merge B into A
+                a.pts.extend(b.pts)
+                a.last_det_frame = b.last_det_frame
+                merged_ids.add(b.id)
+                n_merges += 1
+                break  # move to next A candidate after successful merge
+
+        if merged_ids:
+            self.tracks = [t for t in self.tracks if t.id not in merged_ids]
+
+        return n_merges

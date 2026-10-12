@@ -131,6 +131,19 @@ def main():
     cap.release()
     elapsed = time.time() - t0
     print(f"\nDone: {fi} frames in {elapsed:.1f}s ({fi/elapsed:.1f} fps)")
+
+    # Offline tracklet stitching — fill gap frames from merged tracks
+    n_stitched = tracker.stitch_tracklets()
+    if n_stitched:
+        print(f"Tracklet stitching: merged {n_stitched} broken tracks")
+        # Back-fill detected positions from stitched tracks
+        for t in tracker.tracks:
+            if not t.validated:
+                continue
+            for pt in t.pts:
+                if pt.frame not in detected:
+                    detected[pt.frame] = [float(pt.x), float(pt.y)]
+
     print(f"Detected positions: {len(detected)} frames")
     print(f"Predicted positions: {len(predicted)} frames (includes Kalman fill)")
 
