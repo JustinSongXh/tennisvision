@@ -39,10 +39,10 @@ class TrackerConfig:
     max_gap_frames: int = 5
     min_len: int = 3
     # Court-coordinate speed thresholds (m/s), used when homography available
-    min_speed_ms: float = 3.0
+    min_speed_ms: float = 0.0
     max_speed_ms: float = 90.0
     # Pixel-space fallback (px/frame), used when no homography
-    min_speed_px: float = 5.0
+    min_speed_px: float = 0.0
     max_speed_px: float = 200.0
     # Displacement below this (meters) marks track as static
     static_threshold_m: float = 0.5
@@ -70,19 +70,25 @@ class Track:
         self._H = H
         self._fps = fps
 
-        kf = cv2.KalmanFilter(4, 2)
+        # 6-state constant-acceleration Kalman filter: [x, y, vx, vy, ax, ay]
+        # Learns gravity from observations — predictions follow parabolic arcs.
+        kf = cv2.KalmanFilter(6, 2)
         kf.transitionMatrix = np.array([
-            [1, 0, 1, 0],
-            [0, 1, 0, 1],
-            [0, 0, 1, 0],
-            [0, 0, 0, 1]], dtype=np.float32)
+            [1, 0, 1, 0, 0.5, 0  ],
+            [0, 1, 0, 1, 0,   0.5],
+            [0, 0, 1, 0, 1,   0  ],
+            [0, 0, 0, 1, 0,   1  ],
+            [0, 0, 0, 0, 1,   0  ],
+            [0, 0, 0, 0, 0,   1  ]], dtype=np.float32)
         kf.measurementMatrix = np.array([
-            [1, 0, 0, 0],
-            [0, 1, 0, 0]], dtype=np.float32)
-        kf.processNoiseCov     = np.diag([1.0, 1.0, 4.0, 4.0]).astype(np.float32)
+            [1, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0]], dtype=np.float32)
+        kf.processNoiseCov = np.diag(
+            [1.0, 1.0, 4.0, 4.0, 16.0, 16.0]).astype(np.float32)
         kf.measurementNoiseCov = (np.eye(2, dtype=np.float32) * 2.0)
-        kf.errorCovPost        = (np.eye(4, dtype=np.float32) * 10.0)
-        kf.statePost = np.array([[x], [y], [0.0], [0.0]], dtype=np.float32)
+        kf.errorCovPost = (np.eye(6, dtype=np.float32) * 10.0)
+        kf.statePost = np.array(
+            [[x], [y], [0.0], [0.0], [0.0], [0.0]], dtype=np.float32)
         self.kf = kf
 
     def predict(self):
